@@ -159,6 +159,7 @@ def clean_ica(raw,
               iclabel_lim_probability=0.9,
               iclabel_labels_to_exclude = ['eye blink', 'muscle artifact', 'heart beat', 'line noise', 'channel noise'],
               iclabel_set_average_reference=True,
+              original_ref_channels=None,
               eog_channels=None,
               eog_bipolar_anodes=None,
               eog_bipolar_cathodes=None,
@@ -209,7 +210,10 @@ def clean_ica(raw,
     picks_ica : list of str or None
         List of channel names to include in ICA fitting. If None, all channels are used, excluding those marked as bad and those in ``exclude_ica``.
     exclude_ica : list of str or None
-        List of channel names to exclude from ICA fitting (e.g., reference channels).
+        List of channel names to exclude from ICA fitting. These channels are returned unchanged.
+        When the data are average referenced for ICA (``iclabel_set_average_reference=True``),
+        the reference channel should *not* be excluded: after average referencing it is no longer
+        flat and it must be cleaned to re-reference back to it (see ``original_ref_channels``).
     n_components : int, float, None, or 'auto'
         Number of principal components (PCA) passed to the ICA decomposition.
         If 'auto', the number of components is automatically determined considering m ≥ 30 x n2, where m is the number of samples and n is the number of channels.
@@ -253,6 +257,19 @@ def clean_ica(raw,
         Possible labels include: 'eye blink', 'muscle artifact', 'heart beat', 'line noise', 'channel noise', 'other'.
     iclabel_set_average_reference : bool
         If True, the ICA fitting copy of the data is set to average reference before calling ICLabel (only used when ``label_components_method='iclabel'``).
+        The artifact components are then removed in average reference space and the data are
+        returned in their original reference (see ``original_ref_channels``).
+    original_ref_channels : list of str or None
+        Name(s) of the channel(s) used as reference in the original data (e.g. ``['Cz']`` or
+        ``['M1', 'M2']``). Only used when the data are average referenced for ICA.
+
+        * If provided, the data are average referenced, the artifact components are removed,
+          and the data are re-referenced back to these channels. The reference channels are
+          kept in the ICA fit even if they are detected as bad (a flat reference channel is
+          expected in the original reference) and must not be in ``exclude_ica``.
+        * If None, the artifact signal is estimated in average reference space and subtracted
+          from the data in its original reference. The artifact present at the reference
+          electrode itself (common to all channels) cannot be removed in this case.
     eog_channels : list of str or None
         Existing channel names to use as EOG proxies with find_bads_eog
         (only used when ``label_components_method='correlation'``).
@@ -354,7 +371,29 @@ def clean_ica(raw,
         if save_ica:
             output_dir_ica = output_dir / "ica"
             output_dir_ica.mkdir(exist_ok=True)
-        
+
+    # check the exclude_ica parameter, if the name of a channels is provided, check that it exists in the raw data channels
+    if exclude_ica is not None:
+        for ch in exclude_ica:
+            if ch not in raw.ch_names:
+                raise ValueError(f"Channel '{ch}' specified in exclude_ica does not exist in the raw data")
+
+    # ICA is fitted and applied in average reference space only when using ICLabel with average reference
+    use_avg_ref = (label_components_method == 'iclabel') and iclabel_set_average_reference
+
+    # check the original_ref_channels parameter
+    if original_ref_channels is not None:
+        if isinstance(original_ref_channels, str):
+            original_ref_channels = [original_ref_channels]
+        for ch in original_ref_channels:
+            if ch not in raw.ch_names:
+                raise ValueError(f"Channel '{ch}' specified in original_ref_channels does not exist in the raw data")
+            if exclude_ica is not None and ch in exclude_ica:
+                raise ValueError(f"Reference channel '{ch}' cannot be in exclude_ica: it must be cleaned to re-reference back to it")
+        if not use_avg_ref:
+            print("Warning: original_ref_channels is ignored because the data are not average referenced for ICA")
+            original_ref_channels = None
+
     # get the configurations for rejecting data before ICA
     cfg_artifacts_detection = get_cfg(cfg_artifacts_detection, 'detect_for_ica_config.json')
     cfg_bcbt = get_cfg(cfg_bcbt, 'define_bcbt_raw_ica_config.json')
@@ -392,6 +431,8 @@ def clean_ica(raw,
     print(f"  label_components_method: {label_components_method}")
     print(f"  iclabel_lim_probability: {iclabel_lim_probability}")
     print(f"  iclabel_labels_to_exclude: {iclabel_labels_to_exclude}")
+    print(f"  iclabel_set_average_reference: {iclabel_set_average_reference}")
+    print(f"  original_ref_channels: {original_ref_channels}")
     print(f"  eog_channels: {eog_channels}")
     print(f"  eog_bipolar_anodes: {eog_bipolar_anodes}")
     print(f"  eog_bipolar_cathodes: {eog_bipolar_cathodes}")
@@ -414,13 +455,27 @@ def clean_ica(raw,
     # Get the raw data in mne format for ICA fitting
     raw_ica = raw_ica_apice.to_mne_raw()
 
+    # The original reference channels are flat in the original reference and likely detected as bad,
+    # but they carry signal after average referencing and must be cleaned to re-reference back to them
+    if original_ref_channels is not None:
+        ref_bads = [ch for ch in original_ref_channels if ch in raw_ica.info['bads']]
+        if ref_bads:
+            print(f"Reference channels {ref_bads} were marked as bad; they are kept for the average reference and ICA fitting")
+            raw_ica.info['bads'] = [ch for ch in raw_ica.info['bads'] if ch not in ref_bads]
+
     # Get the picks for ICA fitting
     if picks_ica is None:
         picks_ica = mne.pick_types(raw_ica.info, meg=False, eeg=True, eog=True, ecg=True)
+    elif all(isinstance(p, str) for p in picks_ica):
+        picks_ica = mne.pick_channels(raw_ica.ch_names, include=picks_ica, ordered=False)
     picks_ica = [i for i in picks_ica if raw_ica.ch_names[i] not in raw_ica.info['bads']]
     if exclude_ica is not None:
         picks_ica = [i for i in picks_ica if raw_ica.ch_names[i] not in exclude_ica]
-    
+    if original_ref_channels is not None:
+        missing_ref = [ch for ch in original_ref_channels if raw_ica.ch_names.index(ch) not in picks_ica]
+        if missing_ref:
+            raise ValueError(f"Reference channels {missing_ref} are not in picks_ica: they must be included in the ICA fit to re-reference back to them")
+
     # Power spectrum of the data used for ICA fitting, to check the effect of filtering and artifact marking before ICA
     if report is not None:
         fmax = raw_ica.info['sfreq'] / 2
@@ -456,12 +511,14 @@ def clean_ica(raw,
     if n_components == 'auto':
         n_samples = (raw_ica_apice.artifacts.BT == False).sum()  # number of samples not marked as bad for ICA fitting
         n_channels = len(picks_ica)
+        if use_avg_ref:
+            n_channels -= 1  # the average reference reduces the rank of the data by one
         n_components_auto = min(n_channels, int((n_samples / 30) ** 0.5))  # n_samples ≥ 30 x n_channels^2 => n_channels ≤ sqrt(n_samples / 30)
         print(f"Automatically setting n_components to {n_components_auto} based on the number of samples and channels.")
         n_components = n_components_auto
 
     if label_components_method == 'iclabel':
-        if iclabel_set_average_reference: # ICLabel requires an average reference, so we set it here for ICA fitting
+        if use_avg_ref: # ICLabel requires an average reference, so we set it here for ICA fitting
             raw_ica.set_eeg_reference("average")
         ica = ICA(n_components=n_components, random_state=random_state, noise_cov=noise_cov, max_iter=max_iterint, method=method, fit_params=fit_params)
         ica.fit(raw_ica, 
@@ -505,10 +562,33 @@ def clean_ica(raw,
     # Remove the bad components from the original raw data
     # raw_clean = raw.copy()
     # ica.apply(raw_clean, include=None, exclude = components_to_exclude, n_pca_components=None)
+    # ica.apply only modifies the channels used for fitting (ica.ch_names), so the artifact
+    # signal must be subtracted only from those channels. Channels not used in the fit
+    # (exclude_ica, bad channels, non-picked types) are left untouched.
+    # If no component is flagged, nothing is removed (include=[] would reconstruct all components).
+    # If ICA was fitted in average reference, the artifacts are estimated in average reference
+    # space (same bad channels as for fitting, so that the same average is used), and the data
+    # are returned in their original reference:
+    #   - original_ref_channels provided: clean in average reference and re-reference back to them
+    #   - original_ref_channels not provided: subtract the artifacts from the original data
+    if use_avg_ref:
+        raw_ref_ica = raw.copy()
+        raw_ref_ica.info['bads'] = list(raw_ica.info['bads'])
+        raw_ref_ica.set_eeg_reference("average", verbose='ERROR')
+    else:
+        raw_ref_ica = raw
     raw_clean = raw.copy()
-    artifacts = raw.copy()
-    ica.apply(artifacts, include=components_to_exclude, exclude = [], n_pca_components=None)
-    raw_clean._data = raw._data - artifacts._data
+    if len(components_to_exclude) > 0:
+        artifacts = raw_ref_ica.copy()
+        ica.apply(artifacts, include=components_to_exclude, exclude=[], n_pca_components=None)
+        picks_fit = mne.pick_channels(raw.ch_names, include=ica.ch_names, ordered=False)
+        if original_ref_channels is not None:
+            raw_clean = raw_ref_ica.copy()
+            raw_clean._data[picks_fit] = raw_ref_ica._data[picks_fit] - artifacts._data[picks_fit]
+            raw_clean.set_eeg_reference(ref_channels=original_ref_channels, verbose='ERROR')
+            raw_clean.info['bads'] = list(raw.info['bads'])
+        else:
+            raw_clean._data[picks_fit] = raw._data[picks_fit] - artifacts._data[picks_fit]
 
     # Add some plots to the report to visualize the results of ICA
     if report is not None:
@@ -563,7 +643,7 @@ def clean_ica(raw,
         mid_point = raw.times[0] + ((raw.times[-1] - raw.times[0]) / 2)
         start = max(raw.times[0], mid_point - 15)  # 15 seconds before the midpoint
         stop = min(raw.times[-1], start + 30)  # 30 seconds window
-        fig_overlay = ica.plot_overlay(raw, exclude=components_to_exclude, picks="eeg", start=start, stop=stop, show=False)
+        fig_overlay = ica.plot_overlay(raw_ref_ica, exclude=components_to_exclude, picks="eeg", start=start, stop=stop, show=False)
         try:
             report.add_figure(fig_overlay, "Original and Clean Signal", section="ICA", replace=False)
             plt.close(fig_overlay)
@@ -604,6 +684,8 @@ def clean_ica(raw,
                 "stop_fit": stop_fit,
                 "label_components_method": label_components_method,
                 "iclabel_lim_probability": iclabel_lim_probability,
+                "iclabel_set_average_reference": iclabel_set_average_reference,
+                "original_ref_channels": original_ref_channels,
                 "eog_channels": eog_channels,
                 "eog_bipolar_anodes": eog_bipolar_anodes,
                 "eog_bipolar_cathodes": eog_bipolar_cathodes,

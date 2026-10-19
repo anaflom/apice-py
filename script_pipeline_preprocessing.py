@@ -87,7 +87,7 @@ def main():
         'h_freq_ica': None,  # High-pass frequency for ICA
         'l_freq_artifacts':None,  # Low-pass frequency for artifact detection (set to None to not apply specific low-pass filtering for artifact detection)
         'h_freq_artifacts':None,  # High-pass frequency for artifact detection (set to None to not apply specific high-pass filtering for artifact detection)
-        'exclude_ica': None, # List of channels to exclude from ICA (e.g., reference channels, etc.). Set to None or an empty list to not exclude any channels from ICA.
+        'original_ref_channels': REFERENCE_CHANNELS, # List with reference channels if included in the data.
         'n_components': 'auto',  # Number of ICA components to compute. If float between 0 and 1, select the number of components to explain the specified variance. If int > 1, select the specified number of components. If None, select all components. If 'auto', the number of components will be automatically determined based on the number of channels and amount good data available to fit the ICA model (n_samples ≥ 30 x n_channel**2).
         'method': 'picard',  # ICA method to use (e.g., 'fastica', 'infomax', 'picard', etc.). See MNE documentation for more details.
         'fit_params': dict(ortho=False, extended=True),  # Additional parameters to pass to the ICA fit method. See MNE documentation for more details.
