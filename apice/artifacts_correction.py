@@ -871,6 +871,19 @@ def _build_interpolation_matrix_spline(raw, min_good_time, min_intertime, mask_t
         for iep in range(n_epochs):
             raw_int.artifacts.BCT[iep,:,:] = _modify_rej(raw_int.artifacts.BCT[iep,:,:], segment_samples, max_samples)
 
+    # _modify_rej fills whole blocks, which can put back bad-time samples
+    # (and bad channels) removed above; during bad time most channels are bad,
+    # so a spline there would be built from contaminated sources. Remove them
+    # again (bug review #14b).
+    bct_int = np.asarray(raw_int.artifacts.BCT, dtype=bool)
+    if len(raw_int._data.shape)==2:
+        bct_int[np.tile(np.asarray(raw.artifacts.BC, dtype=bool), (1, n_samples))] = False
+        bct_int[np.tile(np.asarray(raw.artifacts.BT, dtype=bool), (n_electrodes, 1))] = False
+    elif len(raw_int._data.shape)==3:
+        bct_int[np.tile(np.asarray(raw.artifacts.BC, dtype=bool), (1, 1, n_samples))] = False
+        bct_int[np.tile(np.asarray(raw.artifacts.BT, dtype=bool), (1, n_electrodes, 1))] = False
+    raw_int.artifacts.BCT = bct_int.astype(np.asarray(raw_int.artifacts.BCT).dtype)
+
     return raw_int.artifacts.BCT
     
 
