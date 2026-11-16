@@ -59,7 +59,7 @@ SPLICE_METHODS = (1, 'trend', 'adaptive')
 
 def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=1,
                      corrected=None, window=250, guard=5, order=1, align_bad_times=True,
-                     step_window=500, step_k=3.0, null_step=25, min_good_frac=0.5,
+                     step_window=1000, step_min=250, step_k=2.5, null_step=25,
                      anchor='sample', anchor_window=25, undecidable='method1', stats=None):
     """Splice corrected segments to reduce discontinuities at segment borders.
 
@@ -98,11 +98,11 @@ def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=
           inside it (splicing study 2026-11). See ``_splice_segments_trend``.
         - ``'adaptive'``: decides for each non-good run (corrected, bad or
           bad time) whether it is a step, by comparing the level of the good
-          data before and after it (``step_window`` samples per side, each
-          with at least ``min_good_frac`` good samples) with the variability
-          of such before/after differences in GOOD data of the same channel
-          (all-good gap of the same length, windows with at least
-          ``min_good_frac`` good samples). Steps: the data after the run are
+          data before and after it (contiguous good data, up to
+          ``step_window`` samples per side, at least ``step_min``) with the
+          variability of such before/after differences in GOOD data of the
+          same channel (all-good gap of the same length, windows chosen with
+          the same rule). Steps: the data after the run are
           shifted to the level before it (as method 1, but with robust
           levels, not single samples). Then the corrected samples are aligned
           at their edges, keeping their own shape (as MATLAB method 3; see
@@ -123,12 +123,13 @@ def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=
         With ``'trend'`` / ``'adaptive'``, also align bad-time runs to the
         surrounding good data (they stay marked as bad; this only reduces how
         much a later high-pass spreads their offset into good data).
-    step_window : int, default=500
-        ``'adaptive'``: samples per side used to estimate the level before
-        and after a segment (callers pass ~2 s).
-    min_good_frac : float, default=0.5
-        ``'adaptive'``: minimum proportion of good samples in each
-        ``step_window`` (for the levels and for the null distribution).
+    step_window : int, default=1000
+        ``'adaptive'``: maximum samples per side used to estimate the level
+        before and after a segment: the contiguous good data next to it,
+        stopping at neighbouring artifacts (callers pass ~4 s).
+    step_min : int, default=250
+        ``'adaptive'``: minimum contiguous good samples needed on each side
+        to decide (callers pass ~1 s); same rule for the null distribution.
     undecidable : {'method1', 'edges'}, default='method1'
         ``'adaptive'``, when there is not enough good data to decide:
         'method1' splices that run as method 1 (offset to the data before;
@@ -146,7 +147,7 @@ def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=
         artifact edges, less exact otherwise).
     anchor_window : int, default=25
         ``'adaptive'`` with anchor='linear' (callers pass ~100 ms).
-    step_k : float, default=3.0
+    step_k : float, default=2.5
         ``'adaptive'``: a segment is a step if the before/after level
         difference exceeds ``step_k`` robust SDs of the null distribution.
     null_step : int, default=25
@@ -172,7 +173,7 @@ def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=
                                        corrected=corrected, window=window, guard=guard,
                                        order=order, align_bad_times=align_bad_times,
                                        step_window=step_window, step_k=step_k,
-                                       null_step=null_step, min_good_frac=min_good_frac,
+                                       null_step=null_step, step_min=step_min,
                                        anchor=anchor, anchor_window=anchor_window,
                                        undecidable=undecidable, stats=stats)
     else:
@@ -348,34 +349,55 @@ def _good_window_sums(x, ok):
     return cs_x, cs_n
 
 
-def _step_null_sd(cs_x, cs_n, starts, ends, gap, window, guard, null_step, min_good_frac=0.5,
-                  min_null=20):
-    """Robust SD of before/after level differences across a gap of ``gap``
-    samples, using good data only.
+def _contiguous_good(ok):
+    """For every index i in [0, n]: number of contiguous good samples ending
+    just before i (``before[i]``) and starting at i (``after[i]``)."""
+    n = ok.size
+    idx = np.arange(n)
+    last_bad = np.maximum.accumulate(np.where(~ok, idx, -1))             # last bad <= j
+    next_bad = np.minimum.accumulate(np.where(~ok, idx, n)[::-1])[::-1]  # next bad >= j
+    before = np.zeros(n + 1, dtype=np.int64)
+    before[1:] = idx - last_bad                                          # i = j + 1
+    after = np.zeros(n + 1, dtype=np.int64)
+    after[:n] = next_bad - idx
+    return before, after
 
-    Positions are taken every ``null_step`` samples within each epoch. A
-    position is used if the gap and both guards are entirely good data and
-    each ``window`` has at least ``min_good_frac`` good samples; levels are
-    the means of the good samples of each window. Returns None if fewer than
-    ``min_null`` positions qualify.
+
+def _step_null_sd(cs_x, good_before, good_after, starts, ends, gap, window, min_win, guard,
+                  null_step, min_null=20):
+    """Robust SD of before/after level differences across a gap of ``gap``
+    samples, using contiguous good data only (the same rule as the levels).
+
+    Positions (gap start) every ``null_step`` samples within each epoch. A
+    position is used if the gap and both guards are entirely good and, on
+    each side, the contiguous good data next to the guard (up to ``window``
+    samples, within the epoch) has at least ``min_win`` samples. Levels are
+    the means of those windows. Returns None if fewer than ``min_null``
+    positions qualify.
     """
-    span = 2 * window + 2 * guard + gap
     pos = []
     for ei, ef in zip(starts, ends):
-        if ef - ei >= span:
-            pos.append(np.arange(ei, ef - span + 1, max(int(null_step), 1)))
+        lo, hi = ei + guard + min_win, ef - gap - guard - min_win
+        if hi >= lo:
+            pos.append(np.arange(lo, hi + 1, max(int(null_step), 1)))
     if not pos:
         return None
-    a = np.concatenate(pos)
-    l0, l1 = a, a + window
-    m0, m1 = l1, l1 + 2 * guard + gap                  # guards + gap: all good
-    r0, r1 = m1, a + span
-    n_l, n_m, n_r = cs_n[l1] - cs_n[l0], cs_n[m1] - cs_n[m0], cs_n[r1] - cs_n[r0]
-    need = max(1, int(np.ceil(min_good_frac * window)))
-    use = (n_m == (m1 - m0)) & (n_l >= need) & (n_r >= need)
+    p = np.concatenate(pos)
+    e_start = np.zeros_like(p)
+    e_end = np.zeros_like(p)
+    for ei, ef in zip(starts, ends):
+        inside = (p >= ei) & (p < ef)
+        e_start[inside], e_end[inside] = ei, ef
+    lb = p - guard                                   # left window ends here (exclusive)
+    r0 = p + gap + guard                             # right window starts here
+    clean_gap = good_after[lb] >= gap + 2 * guard
+    L = np.minimum(np.minimum(good_before[lb], window), lb - e_start)
+    R = np.minimum(np.minimum(good_after[np.minimum(r0, good_after.size - 1)], window), e_end - r0)
+    use = clean_gap & (L >= min_win) & (R >= min_win)
     if use.sum() < min_null:
         return None
-    d = (cs_x[r1[use]] - cs_x[r0[use]]) / n_r[use] - (cs_x[l1[use]] - cs_x[l0[use]]) / n_l[use]
+    lb, r0, L, R = lb[use], r0[use], L[use], R[use]
+    d = (cs_x[r0 + R] - cs_x[r0]) / R - (cs_x[lb] - cs_x[lb - L]) / L
     mad = np.median(np.abs(d - np.median(d)))
     return 1.4826 * mad if mad > 0 else None
 
@@ -385,7 +407,7 @@ SPLICE_STEP_DECISIONS = ('step', 'no_step', 'undecidable')
 
 def _splice_segments_adaptive(data, bad_if, epoch_if, bct=None, bt=None, bc=None, corrected=None,
                               window=250, guard=5, order=1, align_bad_times=True,
-                              step_window=500, step_k=3.0, null_step=25, min_good_frac=0.5,
+                              step_window=1000, step_min=250, step_k=2.5, null_step=25,
                               anchor='sample', anchor_window=25, undecidable='method1',
                               stats=None, min_side=3):
     """Step-aware splicing (see ``_splice_segments``, method ``'adaptive'``).
@@ -393,13 +415,15 @@ def _splice_segments_adaptive(data, bad_if, epoch_if, bct=None, bt=None, bc=None
     Per channel, every run of non-good samples (corrected, bad or bad time),
     split at epoch limits, is examined in time order:
 
-    1. Step decision. Levels: means of the good samples in ``step_window``
-       samples before the run and after it (skipping ``guard``), each window
-       needing at least ``min_good_frac`` good samples. Their difference is
+    1. Step decision. Levels: means of the contiguous good data next to the
+       run (skipping ``guard``), up to ``step_window`` samples on each side
+       and stopping at the neighbouring non-good runs and the epoch limits;
+       each side needs at least ``step_min`` samples. Their difference is
        compared with the null distribution of the same difference across a
        gap of the same length, at positions where the gap is entirely good
-       data and each window has at least ``min_good_frac`` good samples
-       (``_step_null_sd``; good data of that channel only, within an epoch).
+       and the contiguous good data on each side, computed the same way, has
+       at least ``step_min`` samples (``_step_null_sd``; good data of that
+       channel only, within an epoch).
        |difference| > ``step_k`` robust SDs: 'step', and all the data after
        the run, up to the end of the epoch, are shifted by -difference.
        Otherwise 'no_step'. If the levels or the null cannot be computed:
@@ -444,13 +468,14 @@ def _splice_segments_adaptive(data, bad_if, epoch_if, bct=None, bt=None, bc=None
             stats.setdefault(key, 0)
 
     dN = data_.copy()
-    need = max(min_side, int(np.ceil(min_good_frac * step_window)))
+    need = max(min_side, int(step_min))
     for ch in range(n_ch):
         if bc[ch]:
             continue
         ok = ~(np.logical_or(bct[ch], bt) | corrected[ch])
         x = dN[ch]
         cs_x, cs_n = _good_window_sums(x, ok)
+        good_before, good_after = _contiguous_good(ok)
         null_cache = {}
         runs = _true_runs(~ok)
         for k, (I, F) in enumerate(runs):
@@ -473,18 +498,19 @@ def _splice_segments_adaptive(data, bad_if, epoch_if, bct=None, bt=None, bc=None
                     if n_l >= need and n_r >= need:
                         gap = f0 - i0
                         if gap not in null_cache:
-                            null_cache[gap] = _step_null_sd(cs_x, cs_n, starts, ends, gap,
-                                                            step_window, guard, null_step,
-                                                            min_good_frac=min_good_frac)
+                            null_cache[gap] = _step_null_sd(cs_x, good_before, good_after,
+                                                            starts, ends, gap, step_window,
+                                                            need, guard, null_step)
                         sd = null_cache[gap]
                         if sd is not None:
                             diff = (cs_x[rb] - cs_x[ra]) / n_r - (cs_x[lb] - cs_x[la]) / n_l
                             if abs(diff) > step_k * sd:
                                 decision = 'step'
                                 x[f0:ef] -= diff
-                                # null positions have an all-good gap, so a
-                                # constant shift after a non-good run never
-                                # changes them: the cache stays valid
+                                # null positions lie inside single stretches
+                                # of good data, so a constant shift after a
+                                # non-good run never changes them: the cache
+                                # stays valid
                                 cs_x, cs_n = _good_window_sums(x, ok)
                             else:
                                 decision = 'no_step'
@@ -1405,13 +1431,16 @@ class TargetPCA(ArtCorrection):
     splice_undecidable : {'method1', 'edges'}, default='method1'
         With 'adaptive', how to splice segments without enough good data to
         decide whether they are steps (see ``_splice_segments``).
+    splice_step_k : float, default=2.5
+        With 'adaptive', a segment is a step if the before/after level
+        difference exceeds this many robust SDs (see ``_splice_segments``).
     save_corrected : bool, default=True
         Whether to update correction masks in ``raw.artifacts``.
     """
 
     def __init__(self, max_time=0.100, components_to_remove=None, variance_to_remove=0.98, mask_time=0.05,
                  all_time='all', all_channel='no_bad_channel', all_epochs='all', splice_method=1, save_corrected=True,
-                 splice_undecidable='method1'):
+                 splice_undecidable='method1', splice_step_k=2.5):
         
         super().__init__()
         
@@ -1420,7 +1449,8 @@ class TargetPCA(ArtCorrection):
                            variance_to_remove=variance_to_remove, mask_time=mask_time,
                            all_time=all_time, all_channel=all_channel, all_epochs=all_epochs,
                            save_corrected=save_corrected, index_to_remove=[], splice_method=splice_method,
-                           splice_undecidable=splice_undecidable, verbose=True)
+                           splice_undecidable=splice_undecidable, splice_step_k=splice_step_k,
+                           verbose=True)
         
 
     def correct(self, raw):         
@@ -1454,6 +1484,7 @@ class TargetPCA(ArtCorrection):
                                                                 all_epochs=self.params['all_epochs'],
                                                                 splice_method=self.params['splice_method'],
                                                                 splice_undecidable=self.params.get('splice_undecidable', 'method1'),
+                                                                splice_step_k=self.params.get('splice_step_k', 2.5),
                                                                 stats=stats,
                                                                 )
 
@@ -1466,7 +1497,7 @@ class TargetPCA(ArtCorrection):
     @staticmethod
     def apply_target_PCA(raw, max_time=0.100, components_to_remove=None, variance_to_remove=0.98, mask_time=0.05,
                  all_time='all', all_channel='no_bad_channel', all_epochs='all', splice_method=1,
-                 splice_undecidable='method1', stats=None):
+                 splice_undecidable='method1', splice_step_k=2.5, stats=None):
         """Apply target PCA correction and return corrected data plus mask.
 
         Parameters
@@ -1491,6 +1522,8 @@ class TargetPCA(ArtCorrection):
             Splicing method for corrected segments.
         splice_undecidable : {'method1', 'edges'}, default='method1'
             With 'adaptive': splicing of undecidable segments.
+        splice_step_k : float, default=2.5
+            With 'adaptive': step threshold in robust SDs.
         stats : dict | None, default=None
             With 'adaptive': filled with the counts of step decisions.
 
@@ -1631,7 +1664,9 @@ class TargetPCA(ArtCorrection):
                         d = _splice_segments(d, bad_if, epoch_if, bct=BCT[el, :], method=splice_method,
                                              window=int(round(1.0 * raw.info['sfreq'])),
                                              guard=int(round(0.02 * raw.info['sfreq'])),
-                                             step_window=int(round(2.0 * raw.info['sfreq'])),
+                                             step_window=int(round(4.0 * raw.info['sfreq'])),
+                                             step_min=int(round(1.0 * raw.info['sfreq'])),
+                                             step_k=splice_step_k,
                                              null_step=int(round(0.1 * raw.info['sfreq'])),
                                              anchor_window=int(round(0.1 * raw.info['sfreq'])),
                                              undecidable=splice_undecidable, stats=stats)
@@ -1851,6 +1886,9 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
     splice_undecidable : {'method1', 'edges'}, default='method1'
         With 'adaptive', how to splice segments without enough good data to
         decide whether they are steps (see ``_splice_segments``).
+    splice_step_k : float, default=2.5
+        With 'adaptive', a segment is a step if the before/after level
+        difference exceeds this many robust SDs (see ``_splice_segments``).
     save_corrected : bool, default=True
         Whether to update correction masks in ``raw.artifacts``.
     verbose : bool, default=True
@@ -1861,7 +1899,7 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
 
     def __init__(self, n_jobs=-1, p=0.5, p_neighbors=1, min_good_time=1.00, min_intertime=0.100, mask_time=0.100, 
                  min_segment_time=0.200, splice_method=1, save_corrected=True, verbose=True,
-                 parallelize_mode='auto', splice_undecidable='method1'):
+                 parallelize_mode='auto', splice_undecidable='method1', splice_step_k=2.5):
         
         super().__init__(verbose=verbose)
 
@@ -1877,6 +1915,7 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
                            min_intertime=min_intertime, mask_time=mask_time, 
                            min_segment_time=min_segment_time,
                            splice_method=splice_method, splice_undecidable=splice_undecidable,
+                           splice_step_k=splice_step_k,
                            save_corrected=save_corrected, verbose=verbose,
                            parallelize_mode=parallelize_mode)
     
@@ -2117,7 +2156,9 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
                                             corrected=int_i,
                                             window=int(round(1.0 * sfreq)),
                                             guard=int(round(0.02 * sfreq)),
-                                            step_window=int(round(2.0 * sfreq)),
+                                            step_window=int(round(4.0 * sfreq)),
+                                            step_min=int(round(1.0 * sfreq)),
+                                            step_k=self.params.get('splice_step_k', 2.5),
                                             null_step=int(round(0.1 * sfreq)),
                                             anchor_window=int(round(0.1 * sfreq)),
                                             undecidable=self.params.get('splice_undecidable', 'method1'),

@@ -8,5 +8,6 @@
     "all_epochs": "all",
     "splice_method": 1,
     "splice_undecidable": "method1",
+    "splice_step_k": 2.5,
     "save_corrected": true
 }

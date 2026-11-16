@@ -119,7 +119,8 @@ def _splice(y, segs, method, n=None, **kw):
     n = y.size if n is None else n
     kw.setdefault("window", SF)
     kw.setdefault("guard", 5)
-    kw.setdefault("step_window", 2 * SF)
+    kw.setdefault("step_window", 4 * SF)
+    kw.setdefault("step_min", SF)
     kw.setdefault("null_step", SF // 10)
     return np.squeeze(_splice_segments(y, np.array(segs), np.array([0, n]), method=method, **kw))
 
@@ -293,15 +294,17 @@ def test_undecidable_edges_option_leaves_the_step():
 
 
 def test_null_needs_only_half_good_windows():
-    """Dense artifacts (bad every 2 s) must not make every segment
-    undecidable: the null windows only need 50 % good samples. The segment
-    itself has >1 s of contiguous good data on each side (its level windows
-    stop at the neighbouring artifacts and need 50 % of 2 s)."""
+    """Frequent artifacts (bad every 3 s) must not make every segment
+    undecidable. The null uses positions inside single clean stretches with
+    >= step_min (1 s) of contiguous good data on each side of the gap, so
+    clean stretches of ~2.7 s are enough (with artifacts every 2 s, i.e.
+    1.7 s clean stretches, no null can be built and the run falls back to
+    method 1). The segment itself has >1 s of clean data on each side."""
     x, y, I, F = _step_case(seed=11)
     n = y.size
     bct = np.zeros(n, bool)
     margin = int(1.3 * SF)
-    for s in range(100, n - 100, 2 * SF):             # 0.3 s bad every 2 s
+    for s in range(100, n - 100, 3 * SF):             # 0.3 s bad every 3 s
         if s + int(0.3 * SF) <= I - margin or s >= F + margin:
             bct[s:s + int(0.3 * SF)] = True
     st = {}
@@ -309,7 +312,8 @@ def test_null_needs_only_half_good_windows():
     assert st["step"] == 1
     after = slice(F + 50, None)
     good_after = ~bct[after]
-    assert _rms((ad[after] - x[after])[good_after]) < 15e-6
+    # residual offset ~ slow-wave level differences between ~1.3 s windows
+    assert _rms((ad[after] - x[after])[good_after]) < 25e-6
 
 
 def test_level_windows_do_not_cross_other_artifacts():
@@ -324,6 +328,14 @@ def test_level_windows_do_not_cross_other_artifacts():
     ok[I:F] = False
     before = slice(I - 75, I)                          # good data between the two
     np.testing.assert_array_equal(ad[before], y[before])
+
+
+def test_contiguous_good_counts():
+    from apice.artifacts_correction import _contiguous_good
+    ok = np.array([1, 1, 0, 1, 1, 1, 0, 0, 1], bool)
+    before, after = _contiguous_good(ok)
+    assert before.tolist() == [0, 1, 2, 0, 1, 2, 3, 0, 0, 1]
+    assert after.tolist() == [2, 1, 0, 3, 2, 1, 0, 0, 1, 0]
 
 
 def test_unknown_method_raises():
