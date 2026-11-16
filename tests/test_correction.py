@@ -59,11 +59,16 @@ def _typical_step(x):
     return np.percentile(np.abs(np.diff(x)), 99)
 
 
+@pytest.mark.parametrize("method", [1, "trend"])
 @pytest.mark.parametrize("placement", ["start", "end", "between", "one_bad_boundary"])
-def test_spline_segments_no_edge_discontinuity(placement):
+def test_spline_segments_no_edge_discontinuity(placement, method):
+    """Method 1 makes edges continuous by construction (strict tolerance).
+    'trend' matches the segment to a robust trend of the surrounding data, not
+    to the single neighbouring sample, so a residual step of the size of the
+    local activity is expected; it must still remove the realignment offset."""
     r, truth, corrupted, only = _setup(placement)
     before = r.get_data().copy()
-    cfg = cfg_correction_spline_segments(parallelize_mode="channels")
+    cfg = cfg_correction_spline_segments(parallelize_mode="channels", splice_method=method)
     cfg["n_jobs"] = 1
     quiet(r.correct_spline_segments, cfg=cfg)
     after = r.get_data()
@@ -80,6 +85,8 @@ def test_spline_segments_no_edge_discontinuity(placement):
         x = after[ch]
         tol = 2 * _typical_step(before[ch, ~truth.mask[ch]])
         assert OFFSET > 5 * tol, "test would not detect a missing realignment"
+        if method == "trend":
+            tol = OFFSET / 4
         edges = _edges(cct[ch])
         assert len(edges) >= 1
         for b in edges:

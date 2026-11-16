@@ -54,7 +54,11 @@ def _print_header(header, separator="="):
 
 # %% FUNCTIONS FOR SPLICING
 
-def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=1):
+SPLICE_METHODS = ('trend', 1)
+
+
+def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method='trend',
+                     corrected=None, window=250, guard=5, order=1, align_bad_times=True):
     """Splice corrected segments to reduce discontinuities at segment borders.
 
     Parameters
@@ -62,18 +66,43 @@ def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=
     data : numpy.ndarray
         Input data array with shape (channels, samples) or (samples,).
     bad_if : numpy.ndarray
-        Array of segment start/end sample indices to splice.
+        Array of segment start/end sample indices to splice (end exclusive).
     epoch_if : numpy.ndarray
-        Epoch boundaries as start/end sample indices.
+        Epoch boundaries as start/end sample indices (end exclusive).
     bct : numpy.ndarray | None, default=None
-        Bad-channel-time mask.
+        Bad-channel-time mask (corrected samples must NOT be marked).
     bt : numpy.ndarray | None, default=None
         Bad-time mask.
     bc : numpy.ndarray | None, default=None
         Bad-channel mask.
-    method : int | None, default=1
-        Splicing strategy. ``1`` applies linear alignment, ``None`` disables
-        splicing.
+    method : {'trend', 1} | None, default='trend'
+        Splicing strategy.
+
+        - ``'trend'`` (default): only the corrected samples change. The
+          low-order trend of each corrected segment (per channel) is replaced
+          by a robust trend fitted to the good data on both sides of it
+          (``window`` samples per side, skipping ``guard`` samples next to
+          the segment, within the epoch, excluding bad and corrected
+          samples). Good data are never modified. See
+          ``_splice_segments_trend``.
+        - ``1``: legacy APICE / MATLAB ``eega_splicesgments1``: each segment
+          after a boundary is shifted to start at the previous sample; the
+          offsets accumulate, so all later good data are shifted too (a
+          high-pass filter is then needed to remove the resulting drifts).
+        - ``None`` / ``0``: no splicing.
+    corrected : numpy.ndarray | None, default=None
+        Boolean (channels, samples) mask of corrected samples, used by
+        ``'trend'`` to know which channels changed in each segment. If None,
+        all channels in ``bad_if`` segments are considered corrected.
+    window, guard : int, default=250, 5
+        Samples per side used for the trend fit, and samples skipped next to
+        the segment (``'trend'`` only). Callers pass ~1 s and ~20 ms.
+    order : int, default=1
+        Order of the trend (``'trend'`` only).
+    align_bad_times : bool, default=True
+        With ``'trend'``, also align bad-time runs to the surrounding good
+        data (they stay marked as bad; this only reduces how much a later
+        high-pass spreads their offset into good data).
 
     Returns
     -------
@@ -85,8 +114,102 @@ def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=
         print('Not splicing for alingment was performed')
     elif method == 1:
         dN = _splice_segments1(data, bad_if, epoch_if, bct=bct, bt=bt, bc=bc)
+    elif method == 'trend':
+        dN = _splice_segments_trend(data, bad_if, epoch_if, bct=bct, bt=bt, bc=bc,
+                                    corrected=corrected, window=window, guard=guard,
+                                    order=order, align_bad_times=align_bad_times)
     else:
-        raise Exception("the only possible method is 1 (or None) ")
+        raise ValueError(f"splice method must be one of {SPLICE_METHODS} or None, got {method!r}")
+    return dN
+
+
+def _robust_polyfit(t, v, order, thresh=3.0, niter=4):
+    """Polynomial fit that iteratively drops samples with residuals above
+    ``thresh`` SDs (as NoiseTools' nt_detrend). Returns None if too few samples."""
+    keep = np.isfinite(v)
+    p = None
+    for _ in range(niter):
+        if keep.sum() < order + 1:
+            break
+        p = np.polyfit(t[keep], v[keep], order)
+        r = v - np.polyval(p, t)
+        s = np.std(r[keep])
+        new = keep & (np.abs(r) < thresh * s) if s > 0 else keep
+        if new.sum() == keep.sum():
+            break
+        keep = new
+    return p
+
+
+def _true_runs(mask):
+    """(start, stop) pairs of the True runs of a 1-D boolean vector (stop exclusive)."""
+    d = np.diff(np.r_[0, np.asarray(mask, dtype=np.int8), 0])
+    return list(zip(np.where(d == 1)[0], np.where(d == -1)[0]))
+
+
+def _splice_segments_trend(data, bad_if, epoch_if, bct=None, bt=None, bc=None, corrected=None,
+                           window=250, guard=5, order=1, align_bad_times=True, min_side=3):
+    """Segment-only splicing by trend replacement (see ``_splice_segments``).
+
+    For each channel and each run of corrected samples [I, F) (split at epoch
+    limits), fit a robust polynomial of ``order`` to the good samples in
+    [I-guard-window, I-guard) and [F+guard, F+guard+window) (within the epoch),
+    fit the same order to the segment itself, and replace the segment's trend
+    by the surrounding one. With good data on one side only, a constant level
+    is matched. Using a window and a guard, not the single neighbouring
+    sample, keeps the alignment robust when the detection misses the edges
+    of an artifact (splicing study, 2026-11).
+    """
+    data_, bad_if, epoch_if, bct, bt, bc, I_all, F_all, Epoch_I, Epoch_F = \
+        _prepare_data_for_splicing(data, bad_if, epoch_if, bct, bt, bc)
+    n_ch, n_s = data_.shape
+    window = max(int(window), min_side)
+    guard = max(int(guard), 0)
+
+    if corrected is None:
+        corrected = np.zeros((n_ch, n_s), dtype=bool)
+        for I, F in zip(np.ravel(I_all), np.ravel(F_all)):
+            corrected[:, int(I):int(F)] = True
+    else:
+        corrected = np.reshape(np.asarray(corrected, dtype=bool), (n_ch, n_s))
+
+    # epoch index of every sample
+    epoch_of = np.full(n_s, -1)
+    for e, (ei, ef) in enumerate(zip(np.ravel(Epoch_I), np.ravel(Epoch_F))):
+        epoch_of[int(ei):int(ef)] = e
+
+    dN = data_.copy()
+    for ch in range(n_ch):
+        if bc[ch]:
+            continue
+        bad_ch = np.logical_or(bct[ch], bt) & ~corrected[ch]
+        ok = ~bad_ch & ~corrected[ch]
+        targets = _true_runs(corrected[ch])
+        if align_bad_times:
+            targets += _true_runs(bt & ~corrected[ch])
+        for I, F in targets:
+            # split runs that cross epoch limits
+            cuts = [I] + [int(b) for b in np.ravel(Epoch_I) if I < b < F] + [F]
+            for i0, f0 in zip(cuts[:-1], cuts[1:]):
+                e = epoch_of[i0]
+                ei, ef = int(np.ravel(Epoch_I)[e]), int(np.ravel(Epoch_F)[e])
+                left = np.arange(max(ei, i0 - guard - window), max(ei, i0 - guard))
+                right = np.arange(min(ef, f0 + guard), min(ef, f0 + guard + window))
+                left = left[ok[left]]
+                right = right[ok[right]]
+                has_l, has_r = left.size >= min_side, right.size >= min_side
+                if not (has_l or has_r):
+                    continue
+                o = order if (has_l and has_r) else 0
+                c = (i0 + f0 - 1) / 2.0
+                tt = np.concatenate([left, right]) if (has_l and has_r) else (left if has_l else right)
+                p_out = _robust_polyfit(tt - c, data_[ch, tt], o)
+                ts = np.arange(i0, f0)
+                p_seg = _robust_polyfit(ts - c, data_[ch, i0:f0], min(o, max(f0 - i0 - 2, 0)))
+                if p_out is None or p_seg is None:
+                    continue
+                dN[ch, i0:f0] = data_[ch, i0:f0] - np.polyval(p_seg, ts - c) + np.polyval(p_out, ts - c)
+
     return dN
 
 
@@ -219,16 +342,21 @@ def _splice_segments1(data, bad_if, epoch_if, bct=None, bt=None, bc=None):
                     if np.any(np.logical_and(id_bad_electrode,  bc==False)):
                         el = np.logical_and(id_bad_electrode,  bc==False)
                         el = np.asarray(np.where(el)[0])
-                        x = np.arange(the_I[kk - 1], the_I[kk])
-                        deltaX = x[-1] - x[0]
-                        if deltaX!=0:
-                            for i in el:
+                        for i in el:
+                            # ramp over the contiguous bad run that ends at
+                            # this boundary only (bug review #2: the ramp used
+                            # to start at the previous boundary, tilting the
+                            # good data before the bad run)
+                            bad_i = np.logical_or(bt, bct[i, :])
+                            r0 = the_I[kk] - 1
+                            while r0 - 1 >= the_I[kk - 1] and bad_i[r0 - 1]:
+                                r0 -= 1
+                            x = np.arange(r0, the_I[kk])
+                            deltaX = x[-1] - x[0]
+                            if deltaX != 0:
                                 deltaN = dN[i, x[-1]] - dN[i, x[-1]+1]
                                 p = deltaN / deltaX
-                                y_substract = p * (x - x[0])
-                                dN[i, x] = dN[i, x] - y_substract
-                        else:
-                            print('too short segment')
+                                dN[i, x] = dN[i, x] - p * (x - x[0])
                                 
          
     return dN
@@ -945,14 +1073,14 @@ class TargetPCA(ArtCorrection):
         Channel selection strategy for PCA.
     all_epochs : str, default='all'
         Epoch selection strategy for PCA.
-    splice_method : int, default=1
-        Splicing strategy applied after correction.
+    splice_method : {'trend', 1} | None, default='trend'
+        Splicing strategy applied after correction (see ``_splice_segments``).
     save_corrected : bool, default=True
         Whether to update correction masks in ``raw.artifacts``.
     """
 
     def __init__(self, max_time=0.100, components_to_remove=None, variance_to_remove=0.98, mask_time=0.05,
-                 all_time='all', all_channel='no_bad_channel', all_epochs='all', splice_method=1, save_corrected=True):
+                 all_time='all', all_channel='no_bad_channel', all_epochs='all', splice_method='trend', save_corrected=True):
         
         super().__init__()
         
@@ -1001,7 +1129,7 @@ class TargetPCA(ArtCorrection):
      
     @staticmethod
     def apply_target_PCA(raw, max_time=0.100, components_to_remove=None, variance_to_remove=0.98, mask_time=0.05,
-                 all_time='all', all_channel='no_bad_channel', all_epochs='all', splice_method=1):
+                 all_time='all', all_channel='no_bad_channel', all_epochs='all', splice_method='trend'):
         """Apply target PCA correction and return corrected data plus mask.
 
         Parameters
@@ -1022,7 +1150,7 @@ class TargetPCA(ArtCorrection):
             Channel selection mode.
         all_epochs : str, default='all'
             Epoch selection mode.
-        splice_method : int, default=1
+        splice_method : {'trend', 1} | None, default='trend'
             Splicing method for corrected segments.
 
         Returns
@@ -1156,7 +1284,12 @@ class TargetPCA(ArtCorrection):
                         epoch_i = np.arange(0, n_samples*n_epochs, n_samples)
                         epoch_f = epoch_i+n_samples
                         epoch_if = np.concatenate((epoch_i[:,np.newaxis], epoch_f[:,np.newaxis]), axis=1)
-                        d = _splice_segments(d, bad_if, epoch_if, method=splice_method)
+                        # BCT of this channel (bad times included) tells the
+                        # trend method which samples are not good; corrected
+                        # samples are taken from bad_if
+                        d = _splice_segments(d, bad_if, epoch_if, bct=BCT[el, :], method=splice_method,
+                                             window=int(round(1.0 * raw.info['sfreq'])),
+                                             guard=int(round(0.02 * raw.info['sfreq'])))
     
                     # Store the data
                     data_pca[el, :] = d
@@ -1368,7 +1501,7 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
         Mask duration in seconds around bad segments.
     min_segment_time : float, default=0.200
         Minimum segment length in seconds for rejection regularization.
-    splice_method : int, default=1
+    splice_method : {'trend', 1} | None, default='trend'
         Splicing method after interpolation.
     save_corrected : bool, default=True
         Whether to update correction masks in ``raw.artifacts``.
@@ -1379,7 +1512,7 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
     """
 
     def __init__(self, n_jobs=-1, p=0.5, p_neighbors=1, min_good_time=1.00, min_intertime=0.100, mask_time=0.100, 
-                 min_segment_time=0.200, splice_method=1, save_corrected=True, verbose=True,
+                 min_segment_time=0.200, splice_method='trend', save_corrected=True, verbose=True,
                  parallelize_mode='auto'):
         
         super().__init__(verbose=verbose)
@@ -1627,7 +1760,13 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
                     bc_i = np.squeeze(raw.artifacts.BC[ep,:,0]).copy()
                     bt_i = np.squeeze(raw.artifacts.BT[ep,0,:]).copy()
                 bct_i[int_i] = 0
-                dspliced = _splice_segments(d_i, bad_if, epoch_if, bct=bct_i, bt=bt_i, bc=bc_i, method=1)
+                # splice_method was accepted but ignored (always 1) before
+                sfreq = raw.info['sfreq']
+                dspliced = _splice_segments(d_i, bad_if, epoch_if, bct=bct_i, bt=bt_i, bc=bc_i,
+                                            method=self.params['splice_method'],
+                                            corrected=int_i,
+                                            window=int(round(1.0 * sfreq)),
+                                            guard=int(round(0.02 * sfreq)))
                 interpolatedData[ep,:,:] = dspliced
            
         # reshape if necessary         
