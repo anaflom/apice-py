@@ -119,7 +119,7 @@ def _splice(y, segs, method, n=None, **kw):
     n = y.size if n is None else n
     kw.setdefault("window", SF)
     kw.setdefault("guard", 5)
-    kw.setdefault("step_window", 4 * SF)
+    kw.setdefault("step_window", 2 * SF)
     kw.setdefault("null_step", SF // 10)
     return np.squeeze(_splice_segments(y, np.array(segs), np.array([0, n]), method=method, **kw))
 
@@ -252,6 +252,78 @@ def test_adaptive_null_uses_only_good_data():
     b = _splice(y_noisy, [[I, F]], "adaptive", bct=bct)
     good = ~bct
     np.testing.assert_allclose(a[good], b[good], rtol=0, atol=1e-15)
+
+
+def test_adaptive_reports_its_decisions():
+    x, y, I, F = _step_case()
+    st = {}
+    _splice(y, [[I, F]], "adaptive", stats=st)
+    assert st == {"step": 1, "no_step": 0, "undecidable": 0}
+    x = _clean(seed=5)
+    st = {}
+    _splice(_corrupt(x, 2000, 2250), [[2000, 2250]], "adaptive", stats=st)
+    assert st == {"step": 0, "no_step": 1, "undecidable": 0}
+
+
+def _undecidable_step_case():
+    """A step with too little data before it to estimate the level (the
+    segment starts 1 s into the epoch, the level window is 2 s)."""
+    x, y, _, _ = _step_case(seed=10)
+    I, F = SF, SF + 25
+    y = x.copy()
+    y[I:F] += 50e-6
+    y[F:] += 200e-6
+    return x, y, I, F
+
+
+def test_undecidable_falls_back_to_method1():
+    x, y, I, F = _undecidable_step_case()
+    st = {}
+    ad = _splice(y, [[I, F]], "adaptive", stats=st)
+    m1 = _splice(y, [[I, F]], 1)
+    assert st["undecidable"] == 1
+    np.testing.assert_allclose(ad, m1, rtol=0, atol=1e-15)
+
+
+def test_undecidable_edges_option_leaves_the_step():
+    x, y, I, F = _undecidable_step_case()
+    ad = _splice(y, [[I, F]], "adaptive", undecidable="edges")
+    after = slice(F + 50, None)
+    np.testing.assert_array_equal(ad[after], y[after])     # good data untouched
+
+
+def test_null_needs_only_half_good_windows():
+    """Dense artifacts (bad every 2 s) must not make every segment
+    undecidable: the null windows only need 50 % good samples. The segment
+    itself has >1 s of contiguous good data on each side (its level windows
+    stop at the neighbouring artifacts and need 50 % of 2 s)."""
+    x, y, I, F = _step_case(seed=11)
+    n = y.size
+    bct = np.zeros(n, bool)
+    margin = int(1.3 * SF)
+    for s in range(100, n - 100, 2 * SF):             # 0.3 s bad every 2 s
+        if s + int(0.3 * SF) <= I - margin or s >= F + margin:
+            bct[s:s + int(0.3 * SF)] = True
+    st = {}
+    ad = _splice(y, [[I, F]], "adaptive", bct=bct, stats=st)
+    assert st["step"] == 1
+    after = slice(F + 50, None)
+    good_after = ~bct[after]
+    assert _rms((ad[after] - x[after])[good_after]) < 15e-6
+
+
+def test_level_windows_do_not_cross_other_artifacts():
+    """A bad run shortly BEFORE a step must not be declared a step itself
+    (its 'after' window would otherwise include the jump)."""
+    x, y, I, F = _step_case(seed=12)
+    bct = np.zeros(y.size, bool)
+    bct[I - 150:I - 75] = True                         # 0.3 s bad, 0.3 s before the step
+    st = {}
+    ad = _splice(y, [[I, F]], "adaptive", bct=bct, stats=st)
+    ok = ~bct
+    ok[I:F] = False
+    before = slice(I - 75, I)                          # good data between the two
+    np.testing.assert_array_equal(ad[before], y[before])
 
 
 def test_unknown_method_raises():

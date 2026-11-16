@@ -135,8 +135,11 @@ class SummaryPreprocessing(Summary):
                              "length", 
                              "%_corrected_data", 
                              "%_bad_data", 
-                             "%_bad_channels", 
+                             "%_bad_channels",
                              "%_bad_times",
+                             "n_splice_steps",
+                             "n_splice_no_step",
+                             "n_splice_undecidable",
                              ],
                          try_loading=try_loading)
         if file_id is None:
@@ -182,7 +185,22 @@ class SummaryPreprocessing(Summary):
             bad_channels = np.nan
             bad_times = np.nan
 
-        self.summary_df.loc[len(self.summary_df)] = [self.file_id, step, length, corrected_data, bad_data, bad_channels, bad_times]
+        # 'adaptive' splicing decisions so far (cumulative, counted per
+        # channel and corrected/bad run); NaN if that method was not used
+        splice = getattr(getattr(raw, 'artifacts', None), 'splice_stats', None) or {}
+        row = {
+            "file_id": self.file_id, "step": step, "length": length,
+            "%_corrected_data": corrected_data, "%_bad_data": bad_data,
+            "%_bad_channels": bad_channels, "%_bad_times": bad_times,
+            "n_splice_steps": splice.get('step', np.nan),
+            "n_splice_no_step": splice.get('no_step', np.nan),
+            "n_splice_undecidable": splice.get('undecidable', np.nan),
+        }
+        # summaries loaded from older files may lack the newer columns
+        for col in row:
+            if col not in self.summary_df.columns:
+                self.summary_df[col] = np.nan
+        self.summary_df.loc[len(self.summary_df)] = [row.get(c, np.nan) for c in self.summary_df.columns]
 
 class SummaryEpochs(Summary):
     """Summary table specialized for segmented/epoched outputs."""

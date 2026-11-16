@@ -7,5 +7,6 @@
     "all_channel": "no_bad_channel",
     "all_epochs": "all",
     "splice_method": 1,
+    "splice_undecidable": "method1",
     "save_corrected": true
 }

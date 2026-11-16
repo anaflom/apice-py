@@ -6,6 +6,7 @@
     "mask_time": 0.1,
     "min_segment_time": 0.25,
     "splice_method": 1,
+    "splice_undecidable": "method1",
     "parallelize_mode": "auto",
     "save_corrected": true
 }
