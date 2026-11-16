@@ -7,6 +7,8 @@ generation.
 
 import json
 import re
+import sys
+import traceback
 import numpy as np
 import pandas as pd
 import time
@@ -210,6 +212,7 @@ def run_preprocessing(input_dir,
     for file in files:
 
         print(f"Processing file: {file}")
+        stdout_before = sys.stdout  # console stream, restored if a step fails mid-redirect
 
         try:
         
@@ -328,12 +331,14 @@ def run_preprocessing(input_dir,
                 shared_logger.close()
             
         except Exception as e:
+            # write the error in the log too, then restore the console and report it there
             print(f"Error processing file {file}: {e}")
             if save_log and 'shared_logger' in dir() and shared_logger is not None:
                 try:
                     shared_logger.close()
                 except Exception:
                     pass
+            _report_file_error(file, e, stdout_before)
             continue
             
 
@@ -348,7 +353,7 @@ def run_segmentation(input_dir,
                      baseline=None, 
                      kwargs_events_from_annotations_for_metadata=None,
                      kwargs_make_metadata=None,                             
-                     evoked_by=True,
+                     evoked_by="all",
                      save_log=True,
                      save_epochs=True,
                      save_only_good_epochs=False,
@@ -389,8 +394,10 @@ def run_segmentation(input_dir,
         Keyword arguments used to derive metadata events.
     kwargs_make_metadata : dict | None, default=None
         Keyword arguments used when creating epoch metadata.
-    evoked_by : bool | str | list[str], default=True
-        Event grouping used when computing evoked responses.
+    evoked_by : str | list[str] | bool | None, default='all'
+        Event grouping used when computing evoked responses: ``'all'`` (or
+        True) for one average, a name or list of names for one average per
+        event type, None (or False) for none.
     save_log : bool, default=True
         If True, write one segmentation log per processed recording.
     save_epochs : bool, default=True
@@ -443,6 +450,7 @@ def run_segmentation(input_dir,
     for file in files:
 
         print(f"Processing file: {file}")
+        stdout_before = sys.stdout  # console stream, restored if a step fails mid-redirect
 
         try:
         
@@ -491,6 +499,7 @@ def run_segmentation(input_dir,
             
         except Exception as e:
             print(f"Error processing file {file}: {e}")
+            _report_file_error(file, e, stdout_before)
             continue
 
 
@@ -655,25 +664,29 @@ def preprocess_initial_steps(raw,
     if stim_channels_to_annotations and "stim" in np.unique(raw.get_channel_types()):
         convert_stim_channels_to_annotations(raw)
 
+    # Shape-changing methods: always use the returned object. MNE returns the
+    # same (modified) instance, while RawAPICE returns a new object and leaves
+    # itself untouched, so ignoring the return value silently did nothing.
+
     # DROPPING ELECTRODES -----------------------------------------------------------------------------------------------
     if drop_electrodes is not None:
-        raw.drop_channels(list(drop_electrodes), on_missing='warn')
+        raw = raw.drop_channels(list(drop_electrodes), on_missing='warn')
 
     # PICKING ELECTRODES -----------------------------------------------------------------------------------------------
     if picks is not None:
-        raw.pick(picks)
+        raw = raw.pick(picks)
 
     # CROP TIMES -----------------------------------------------------------------------------------------------
     if crop_times is not None:
-        raw.crop(tmin=crop_times[0], tmax=crop_times[1])
+        raw = raw.crop(tmin=crop_times[0], tmax=crop_times[1])
     if crop_from_beginning is not None:
-            raw.crop(tmin=crop_from_beginning, tmax=None)
+        raw = raw.crop(tmin=crop_from_beginning, tmax=None)
     if crop_from_end is not None:
-            raw.crop(tmin=0, tmax=raw.times[-1]-crop_from_end)    
+        raw = raw.crop(tmin=0, tmax=raw.times[-1]-crop_from_end)
 
     # RESAMPLE -----------------------------------------------------------------------------------------------
     if resample_freq is not None:
-        raw.resample(resample_freq)
+        raw = raw.resample(resample_freq)
 
     # SET THE MONTAGE -----------------------------------------------------------------------------------------------
     if montage is not None:
@@ -919,12 +932,21 @@ def preprocess_apice_default(raw,
     cfg_spline_segments['n_jobs'] = n_jobs
     cfg_spline_channels['n_jobs'] = n_jobs
     
+    # Saving anything requires an output directory
+    _needs_output = {"save_data": save_data, "save_summary": save_summary, "save_cfg": save_cfg,
+                     "save_report": _owns_report and save_report, "save_log": _owns_logger}
+    _missing = [k for k, v in _needs_output.items() if v]
+    if output_dir is None and _missing:
+        raise ValueError(f"output_dir must be provided when {', '.join(_missing)} is True")
+
+    # The summary is always tracked; it is only written to disk if save_summary
+    output_dir_summary = Path(output_dir) / "summary" if output_dir is not None else Path.cwd()
+
     # Create output folder if it does not exist
     if output_dir is not None:
         output_dir = Path(output_dir)
         output_dir.mkdir(exist_ok=True)
         if save_summary:
-            output_dir_summary = output_dir / "summary"
             output_dir_summary.mkdir(exist_ok=True)
         if _owns_report and save_report:
             output_dir_reports = output_dir / "reports"
@@ -1293,9 +1315,7 @@ def segment_default_pipeline(raw,
     _owns_report = (report is None) and create_report
     _owns_logger = (logger is None) and save_log
 
-    # Check that output_dir is provided if any of the saving options is True
-    if output_dir is None and (save_epochs or save_evoked or save_summary or (_owns_report and save_report) or _owns_logger):
-        raise ValueError("output_dir must be provided if any of the saving options is True")
+    evoked_by = _normalize_evoked_by(evoked_by)
 
     # Check that file_name is provided if any of the saving options is True, to use as part of the file name for the saved files
     if file_name is None and (save_epochs or save_evoked or save_summary or (_owns_report and save_report) or _owns_logger):
@@ -1310,6 +1330,17 @@ def segment_default_pipeline(raw,
     cfg_spline_channels['n_jobs'] = n_jobs
 
     
+    # Saving anything requires an output directory
+    _needs_output = {"save_epochs": save_epochs, "save_evoked": save_evoked,
+                     "save_summary": save_summary, "save_cfg": save_cfg,
+                     "save_report": _owns_report and save_report, "save_log": _owns_logger}
+    _missing = [k for k, v in _needs_output.items() if v]
+    if output_dir is None and _missing:
+        raise ValueError(f"output_dir must be provided when {', '.join(_missing)} is True")
+
+    # The summary is always tracked; it is only written to disk if save_summary
+    output_dir_summary = Path(output_dir) / "summary" if output_dir is not None else Path.cwd()
+
     # Create output folder if it does not exist
     if output_dir is not None:
         output_dir = Path(output_dir)
@@ -1324,7 +1355,6 @@ def segment_default_pipeline(raw,
             output_dir_logs = output_dir / "logs"
             output_dir_logs.mkdir(exist_ok=True)
         if save_summary:
-            output_dir_summary = output_dir / "summary"
             output_dir_summary.mkdir(exist_ok=True)
 
     # Initialize object tracking the summary of artifacts
@@ -1553,11 +1583,13 @@ def get_stim_duration(raw, threshold=0.01):
         Maximum detected stim duration in seconds.
     """
 
-    stim_data = raw.copy().pick('stim').get_data()    
-    above_baseline = np.where(stim_data > threshold, 1, 0)
-    onsets, durations = get_onset_and_duration(above_baseline)
+    stim_data = raw.copy().pick('stim').get_data()
+    # active when any stim channel is above threshold (the helper expects a
+    # 1-D vector and the time vector; it used to be called without the latter)
+    above_baseline = np.any(stim_data > threshold, axis=0)
+    onsets, durations = get_onset_and_duration(above_baseline, raw.times)
 
-    return np.max(durations)
+    return float(np.max(durations)) if len(durations) else 0.0
     
 def convert_stim_channels_to_annotations(raw):
     """Convert stim-channel events into MNE annotations.
@@ -1683,12 +1715,46 @@ def generate_metadata_for_epochs(raw,
         col = [c for c in metadata_.columns
                if any(re.search(pattern, c) for pattern in columns_events_to_keep)]
         metadata = metadata_[col]
+    else:
+        metadata = metadata_
     metadata = metadata.reset_index(drop=True)
     
     return metadata
     
 
-def compute_epochs_and_evoked(raw, 
+def _report_file_error(file, error, stdout_before):
+    """Show a per-file error on the console, not only in the redirected log.
+
+    If a step failed while stdout was redirected to a log file, close that
+    stream and restore the console stream, then print the error and its
+    traceback to the console.
+    """
+    if sys.stdout is not stdout_before:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.stdout = stdout_before
+    print(f"Error processing file {file}: {error}", file=sys.stderr)
+    traceback.print_exception(error, file=sys.stderr)
+
+
+def _normalize_evoked_by(evoked_by):
+    """Return None, "all", or a list of event names.
+
+    ``True`` means "all" (it used to crash with ``for ev in True``), ``False``
+    means None, and a single event name is wrapped in a list.
+    """
+    if evoked_by is None or evoked_by is False:
+        return None
+    if evoked_by is True or (isinstance(evoked_by, str) and evoked_by == "all"):
+        return "all"
+    if isinstance(evoked_by, str):
+        return [evoked_by]
+    return list(evoked_by)
+
+
+def compute_epochs_and_evoked(raw,
                  kwargs_events_from_annotations={},
                  metadata=None,
                  tmin=-0.2, 
@@ -1738,7 +1804,9 @@ def compute_epochs_and_evoked(raw,
     summary : SummaryEpochs | None
         Updated summary object, or None when no summary was provided.
     """
-    # get the configurations 
+    evoked_by = _normalize_evoked_by(evoked_by)
+
+    # get the configurations
     cfg_define_bcbt_epochs = get_cfg(cfg_define_bcbt_epochs, 'define_bcbt_epochs_config.json')
     cfg_spline_channels = get_cfg(cfg_spline_channels, 'correction_spline_channels_config.json')
     cfg_bad_epochs = get_cfg(cfg_bad_epochs, 'detect_bad_epochs_config.json')
@@ -1780,7 +1848,9 @@ def compute_epochs_and_evoked(raw,
         summary.add_to_summary('segmentation_Final', epochs, overwrite=True)
     
     # Print summary of artifacts and processing
-    print(f"\nSummary: {print(epochs.artifacts.print_summary())}\n")
+    print("\nSummary:")
+    epochs.artifacts.print_summary()
+    print()
 
     # Compute the evoked responses
     print(

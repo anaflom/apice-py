@@ -52,6 +52,12 @@ class Filter:
             Filters are applied directly to ``raw``.
         """
 
+        nyquist = raw.info['sfreq'] / 2.0
+        if h_freq and h_freq >= nyquist:
+            # e.g. the default 100 Hz low-pass after resampling to 200 Hz
+            print(f"Warning: low-pass cutoff {h_freq} Hz is at or above the Nyquist "
+                  f"frequency ({nyquist} Hz); low-pass filter skipped.")
+            h_freq = None
         if h_freq:
             self.low_pass(raw, f_cutoff=h_freq, n_jobs=n_jobs)
         if l_freq:
