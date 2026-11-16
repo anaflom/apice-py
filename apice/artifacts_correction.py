@@ -1018,11 +1018,11 @@ class TargetPCA(ArtCorrection):
             IE = np.full(1, True)
         else:
             if all_epochs == 'all':
-                IE = np.full((n_epochs_all, 1, 1), True)
+                IE = np.full(n_epochs_all, True)
             elif all_epochs == 'no_bad_epoch':
-                IE = raw.artifacts.BE.copy()==False
+                IE = np.reshape(raw.artifacts.BE, n_epochs_all)==False
             elif all_epochs == 'bad_epoch':
-                IE = raw.artifacts.BE.copy()==True
+                IE = np.reshape(raw.artifacts.BE, n_epochs_all)==True
         get_some_epochs = np.any(IE==0)
         
         # get the data and rejection matrix

@@ -645,7 +645,7 @@ class Artifacts:
                 'BCmanual': np.full((n_channels), False),  # Bad Channel (manual input)
                 'BT': np.full((n_epochs, 1, n_samples), False),  # Bad Time
                 'CCT': np.full((n_epochs, n_channels, n_samples), False),  # Corrected Channel Time
-                'BE': np.full((n_epochs, 1, 1), False),  # Bad Epoch
+                'BE': np.full(n_epochs, False),  # Bad Epoch, shape (n_epochs,)
             }
 
         if not hasattr(obj, 'artifacts'):
@@ -1144,7 +1144,9 @@ class ArtifactsEpochs(Artifacts):
     def update_be(self, be):
         """Merge a new bad-epoch mask into ``BE``."""
         be = np.reshape(be, self.n_epochs)
-        self.BE = np.logical_or(be, self.BE)
+        # reshape the stored mask too, in case it comes from an older object
+        # where BE was (n_epochs, 1, 1); otherwise OR-ing broadcasts to 3-D
+        self.BE = np.logical_or(be, np.reshape(self.BE, self.n_epochs))
  
     def set_bc(self, bc):
         """Set the epoch-wise bad-channel mask."""

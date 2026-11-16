@@ -141,14 +141,38 @@ def test_artifacts_tmin_nonzero_control():
     assert not flagged[3]
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "ArtifactsEpochs.update_be: BE starts as (n,1,1); OR-ing a (n,) vector into it "
-    "broadcasts to (n,n,n), so any keeppre=True rejection before a set_be corrupts BE"))
 def test_update_be_on_fresh_epochs_keeps_shape():
+    """Regression: BE started as (n,1,1), so OR-ing an (n,) vector broadcast to (n,n,n)."""
     ep, _ = make(n_epochs=10)
+    assert np.shape(ep.artifacts.BE) == (10,)
     quiet(ep.define_bad_epochs_manual, [i == 3 for i in range(10)], keeppre=True)
-    assert np.asarray(ep.artifacts.BE).size == 10
+    assert np.shape(ep.artifacts.BE) == (10,)
     assert be(ep).tolist() == [i == 3 for i in range(10)]
+
+
+@pytest.mark.parametrize("which", ["no_bad_epoch", "bad_epoch"])
+def test_target_pca_epoch_subset_runs(which):
+    """Target PCA restricted to good (or bad) epochs leaves the other epochs untouched."""
+    from apice.artifacts_correction import TargetPCA
+    ep, _ = make(n_epochs=10)
+    ep.artifacts.set_be([i == 2 for i in range(10)])
+    ep.artifacts.BCT[5, 0, 100:110] = True   # short glitch in a good epoch
+    ep.artifacts.BCT[2, 1, 100:110] = True   # short glitch in the bad epoch
+    before = ep.get_data().copy()
+    quiet(TargetPCA(all_epochs=which).correct, ep)
+    after = ep.get_data()
+    untouched = 5 if which == "bad_epoch" else 2
+    np.testing.assert_array_equal(after[untouched], before[untouched])
+
+
+def test_update_be_accepts_legacy_3d_be():
+    """Objects created before the fix may still carry BE with shape (n,1,1)."""
+    ep, _ = make(n_epochs=10)
+    ep.artifacts.BE = np.full((10, 1, 1), False)
+    ep.artifacts.BE[2] = True
+    ep.artifacts.update_be([i == 5 for i in range(10)])
+    assert np.shape(ep.artifacts.BE) == (10,)
+    assert np.flatnonzero(ep.artifacts.BE).tolist() == [2, 5]
 
 
 def test_artifacts_tmax_zero():
