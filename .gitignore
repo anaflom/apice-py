@@ -13,10 +13,9 @@ venv/
 .env
 .env.*
 
-# tests
-tests/
+# personal scratch tests and notebooks (not tracked); tests/ is tracked
+local_tests/
 *test*.ipynb
-*test*.py
 random/
 
 # IDE specific files
