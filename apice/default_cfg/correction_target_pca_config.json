@@ -6,6 +6,6 @@
     "all_time": "all",
     "all_channel": "no_bad_channel",
     "all_epochs": "all",
-    "splice_method": "trend",
+    "splice_method": 1,
     "save_corrected": true
 }

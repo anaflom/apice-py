@@ -54,11 +54,12 @@ def _print_header(header, separator="="):
 
 # %% FUNCTIONS FOR SPLICING
 
-SPLICE_METHODS = ('trend', 1)
+SPLICE_METHODS = (1, 'trend', 'adaptive')
 
 
-def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method='trend',
-                     corrected=None, window=250, guard=5, order=1, align_bad_times=True):
+def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=1,
+                     corrected=None, window=250, guard=5, order=1, align_bad_times=True,
+                     step_window=500, step_k=3.0, null_step=25):
     """Splice corrected segments to reduce discontinuities at segment borders.
 
     Parameters
@@ -75,20 +76,31 @@ def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=
         Bad-time mask.
     bc : numpy.ndarray | None, default=None
         Bad-channel mask.
-    method : {'trend', 1} | None, default='trend'
+    method : {1, 'trend', 'adaptive'} | None, default=1
         Splicing strategy.
 
-        - ``'trend'`` (default): only the corrected samples change. The
-          low-order trend of each corrected segment (per channel) is replaced
-          by a robust trend fitted to the good data on both sides of it
+        - ``1`` (default): APICE / MATLAB ``eega_splicesgments1``: each
+          segment after a boundary is shifted to start at the previous
+          sample; the offsets accumulate, so all later data are shifted too
+          (a high-pass filter is then needed to remove the resulting drifts).
+          This removes "step" artifacts (a permanent jump of the baseline
+          where only the jump is marked as bad), at the price of also
+          shifting good data after transient artifacts.
+        - ``'trend'``: only the corrected samples change. The low-order
+          trend of each corrected segment (per channel) is replaced by a
+          robust trend fitted to the good data on both sides of it
           (``window`` samples per side, skipping ``guard`` samples next to
           the segment, within the epoch, excluding bad and corrected
-          samples). Good data are never modified. See
-          ``_splice_segments_trend``.
-        - ``1``: legacy APICE / MATLAB ``eega_splicesgments1``: each segment
-          after a boundary is shifted to start at the previous sample; the
-          offsets accumulate, so all later good data are shifted too (a
-          high-pass filter is then needed to remove the resulting drifts).
+          samples). Good data are never modified, so a step artifact is left
+          in the data after it. See ``_splice_segments_trend``.
+        - ``'adaptive'``: decides for each corrected segment (and bad-time
+          run) whether it is a step, by comparing the level of the good data
+          before and after it (``step_window`` samples per side) with the
+          variability of such before/after differences at random positions
+          of GOOD data in the same channel. Steps: the data after the segment
+          are shifted to the level before it (as method 1, but with robust
+          levels, not single samples). Otherwise, as ``'trend'``. See
+          ``_splice_segments_adaptive``.
         - ``None`` / ``0``: no splicing.
     corrected : numpy.ndarray | None, default=None
         Boolean (channels, samples) mask of corrected samples, used by
@@ -100,9 +112,18 @@ def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=
     order : int, default=1
         Order of the trend (``'trend'`` only).
     align_bad_times : bool, default=True
-        With ``'trend'``, also align bad-time runs to the surrounding good
-        data (they stay marked as bad; this only reduces how much a later
-        high-pass spreads their offset into good data).
+        With ``'trend'`` / ``'adaptive'``, also align bad-time runs to the
+        surrounding good data (they stay marked as bad; this only reduces how
+        much a later high-pass spreads their offset into good data).
+    step_window : int, default=500
+        ``'adaptive'``: samples per side used to estimate the level before
+        and after a segment (callers pass ~2 s).
+    step_k : float, default=3.0
+        ``'adaptive'``: a segment is a step if the before/after level
+        difference exceeds ``step_k`` robust SDs of the null distribution.
+    null_step : int, default=25
+        ``'adaptive'``: spacing (samples) of the positions in good data used
+        to build the null distribution (callers pass ~0.1 s).
 
     Returns
     -------
@@ -118,6 +139,12 @@ def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=
         dN = _splice_segments_trend(data, bad_if, epoch_if, bct=bct, bt=bt, bc=bc,
                                     corrected=corrected, window=window, guard=guard,
                                     order=order, align_bad_times=align_bad_times)
+    elif method == 'adaptive':
+        dN = _splice_segments_adaptive(data, bad_if, epoch_if, bct=bct, bt=bt, bc=bc,
+                                       corrected=corrected, window=window, guard=guard,
+                                       order=order, align_bad_times=align_bad_times,
+                                       step_window=step_window, step_k=step_k,
+                                       null_step=null_step)
     else:
         raise ValueError(f"splice method must be one of {SPLICE_METHODS} or None, got {method!r}")
     return dN
@@ -193,22 +220,154 @@ def _splice_segments_trend(data, bad_if, epoch_if, bct=None, bt=None, bc=None, c
             for i0, f0 in zip(cuts[:-1], cuts[1:]):
                 e = epoch_of[i0]
                 ei, ef = int(np.ravel(Epoch_I)[e]), int(np.ravel(Epoch_F)[e])
-                left = np.arange(max(ei, i0 - guard - window), max(ei, i0 - guard))
-                right = np.arange(min(ef, f0 + guard), min(ef, f0 + guard + window))
-                left = left[ok[left]]
-                right = right[ok[right]]
-                has_l, has_r = left.size >= min_side, right.size >= min_side
-                if not (has_l or has_r):
-                    continue
-                o = order if (has_l and has_r) else 0
-                c = (i0 + f0 - 1) / 2.0
-                tt = np.concatenate([left, right]) if (has_l and has_r) else (left if has_l else right)
-                p_out = _robust_polyfit(tt - c, data_[ch, tt], o)
-                ts = np.arange(i0, f0)
-                p_seg = _robust_polyfit(ts - c, data_[ch, i0:f0], min(o, max(f0 - i0 - 2, 0)))
-                if p_out is None or p_seg is None:
-                    continue
-                dN[ch, i0:f0] = data_[ch, i0:f0] - np.polyval(p_seg, ts - c) + np.polyval(p_out, ts - c)
+                _trend_replace_run(dN[ch], data_[ch], ok, i0, f0, ei, ef,
+                                   window, guard, order, min_side)
+
+    return dN
+
+
+def _trend_replace_run(out, src, ok, i0, f0, ei, ef, window, guard, order, min_side=3):
+    """Replace the trend of src[i0:f0] by the robust trend of the good
+    samples (``ok``) around it, within [ei, ef); writes into ``out``."""
+    left = np.arange(max(ei, i0 - guard - window), max(ei, i0 - guard))
+    right = np.arange(min(ef, f0 + guard), min(ef, f0 + guard + window))
+    left = left[ok[left]]
+    right = right[ok[right]]
+    has_l, has_r = left.size >= min_side, right.size >= min_side
+    if not (has_l or has_r):
+        return False
+    o = order if (has_l and has_r) else 0
+    c = (i0 + f0 - 1) / 2.0
+    tt = np.concatenate([left, right]) if (has_l and has_r) else (left if has_l else right)
+    p_out = _robust_polyfit(tt - c, src[tt], o)
+    ts = np.arange(i0, f0)
+    p_seg = _robust_polyfit(ts - c, src[i0:f0], min(o, max(f0 - i0 - 2, 0)))
+    if p_out is None or p_seg is None:
+        return False
+    out[i0:f0] = src[i0:f0] - np.polyval(p_seg, ts - c) + np.polyval(p_out, ts - c)
+    return True
+
+
+def _good_window_sums(x, ok):
+    """Cumulative sums to get, in O(1), the sum and count of good samples of
+    any window [a, b): sum = cs_x[b] - cs_x[a], count = cs_n[b] - cs_n[a]."""
+    cs_x = np.concatenate([[0.0], np.cumsum(np.where(ok, x, 0.0))])
+    cs_n = np.concatenate([[0], np.cumsum(ok.astype(np.int64))])
+    return cs_x, cs_n
+
+
+def _step_null_sd(cs_x, cs_n, starts, ends, gap, window, guard, null_step, min_null=20):
+    """Robust SD of before/after level differences across a gap of ``gap``
+    samples, at positions where the whole span (both windows, guards and the
+    gap) is good data and lies within one epoch. None if too few positions."""
+    span = 2 * window + 2 * guard + gap
+    pos = []
+    for ei, ef in zip(starts, ends):
+        if ef - ei >= span:
+            pos.append(np.arange(ei, ef - span + 1, max(int(null_step), 1)))
+    if not pos:
+        return None
+    a = np.concatenate(pos)
+    fully_good = (cs_n[a + span] - cs_n[a]) == span
+    a = a[fully_good]
+    if a.size < min_null:
+        return None
+    l0, l1 = a, a + window
+    r0, r1 = a + window + 2 * guard + gap, a + span
+    d = (cs_x[r1] - cs_x[r0]) / window - (cs_x[l1] - cs_x[l0]) / window
+    mad = np.median(np.abs(d - np.median(d)))
+    return 1.4826 * mad if mad > 0 else None
+
+
+def _splice_segments_adaptive(data, bad_if, epoch_if, bct=None, bt=None, bc=None, corrected=None,
+                              window=250, guard=5, order=1, align_bad_times=True,
+                              step_window=500, step_k=3.0, null_step=25, min_side=3):
+    """Step-aware splicing (see ``_splice_segments``, method ``'adaptive'``).
+
+    Per channel, every run of non-good samples (corrected, bad or bad time),
+    split at epoch limits, is examined in time order:
+
+    1. Step decision: the mean of the good samples in ``step_window`` samples
+       before the run (skipping ``guard``) is compared with the mean after it.
+       The difference is compared with the null distribution of the same
+       before/after difference across a gap of the same length, computed at
+       positions where everything (windows, guards and gap) is good data of
+       that channel, within one epoch (falling back to half the gap, then to
+       no gap, if too few such positions exist). If |difference| >
+       ``step_k`` robust SDs, the run is a step and all the data after it, up
+       to the end of the epoch, are shifted by -difference.
+    2. Corrected samples in the run (and bad-time samples, if
+       ``align_bad_times``) get the trend replacement of ``'trend'``,
+       computed on the (possibly shifted) data.
+
+    Bad samples that are neither corrected nor bad time are left as they are
+    (they are still shifted with the rest of the data after a step).
+    """
+    data_, bad_if, epoch_if, bct, bt, bc, I_all, F_all, Epoch_I, Epoch_F = \
+        _prepare_data_for_splicing(data, bad_if, epoch_if, bct, bt, bc)
+    n_ch, n_s = data_.shape
+    window = max(int(window), min_side)
+    step_window = max(int(step_window), min_side)
+    guard = max(int(guard), 0)
+    starts = [int(v) for v in np.ravel(Epoch_I)]
+    ends = [int(v) for v in np.ravel(Epoch_F)]
+
+    if corrected is None:
+        corrected = np.zeros((n_ch, n_s), dtype=bool)
+        for I, F in zip(np.ravel(I_all), np.ravel(F_all)):
+            corrected[:, int(I):int(F)] = True
+    else:
+        corrected = np.reshape(np.asarray(corrected, dtype=bool), (n_ch, n_s))
+
+    epoch_of = np.full(n_s, -1)
+    for e, (ei, ef) in enumerate(zip(starts, ends)):
+        epoch_of[ei:ef] = e
+
+    dN = data_.copy()
+    min_good = max(min_side, step_window // 4)
+    for ch in range(n_ch):
+        if bc[ch]:
+            continue
+        ok = ~(np.logical_or(bct[ch], bt) | corrected[ch])
+        x = dN[ch]
+        cs_x, cs_n = _good_window_sums(x, ok)
+        null_cache = {}
+        for I, F in _true_runs(~ok):
+            cuts = [I] + [b for b in starts if I < b < F] + [F]
+            for i0, f0 in zip(cuts[:-1], cuts[1:]):
+                e = epoch_of[i0]
+                ei, ef = starts[e], ends[e]
+
+                # 1. step decision on the good data before / after the run
+                la, lb = max(ei, i0 - guard - step_window), max(ei, i0 - guard)
+                ra, rb = min(ef, f0 + guard), min(ef, f0 + guard + step_window)
+                n_l, n_r = cs_n[lb] - cs_n[la], cs_n[rb] - cs_n[ra]
+                if n_l >= min_good and n_r >= min_good:
+                    diff = (cs_x[rb] - cs_x[ra]) / n_r - (cs_x[lb] - cs_x[la]) / n_l
+                    gap = f0 - i0
+                    sd = None
+                    for g in (gap, gap // 2, 0):
+                        if g not in null_cache:
+                            null_cache[g] = _step_null_sd(cs_x, cs_n, starts, ends, g, step_window,
+                                                          guard, null_step)
+                        sd = null_cache[g]
+                        if sd is not None:
+                            break
+                    if sd is not None and abs(diff) > step_k * sd:
+                        x[f0:ef] -= diff
+                        # the null spans are fully good, so a constant shift
+                        # after a non-good run never changes them: keep the cache
+                        cs_x, cs_n = _good_window_sums(x, ok)
+
+                # 2. trend replacement of the corrected (and bad-time) samples
+                # (fits only read good samples and the run itself, and are
+                # computed before writing, so x can be both source and output)
+                targets = corrected[ch, i0:f0].copy()
+                if align_bad_times:
+                    targets |= bt[i0:f0] & ~corrected[ch, i0:f0]
+                for a, b in _true_runs(targets):
+                    _trend_replace_run(x, x, ok, i0 + a, i0 + b, ei, ef,
+                                       window, guard, order, min_side)
 
     return dN
 
@@ -1086,14 +1245,14 @@ class TargetPCA(ArtCorrection):
         Channel selection strategy for PCA.
     all_epochs : str, default='all'
         Epoch selection strategy for PCA.
-    splice_method : {'trend', 1} | None, default='trend'
+    splice_method : {1, 'trend'} | None, default=1
         Splicing strategy applied after correction (see ``_splice_segments``).
     save_corrected : bool, default=True
         Whether to update correction masks in ``raw.artifacts``.
     """
 
     def __init__(self, max_time=0.100, components_to_remove=None, variance_to_remove=0.98, mask_time=0.05,
-                 all_time='all', all_channel='no_bad_channel', all_epochs='all', splice_method='trend', save_corrected=True):
+                 all_time='all', all_channel='no_bad_channel', all_epochs='all', splice_method=1, save_corrected=True):
         
         super().__init__()
         
@@ -1142,7 +1301,7 @@ class TargetPCA(ArtCorrection):
      
     @staticmethod
     def apply_target_PCA(raw, max_time=0.100, components_to_remove=None, variance_to_remove=0.98, mask_time=0.05,
-                 all_time='all', all_channel='no_bad_channel', all_epochs='all', splice_method='trend'):
+                 all_time='all', all_channel='no_bad_channel', all_epochs='all', splice_method=1):
         """Apply target PCA correction and return corrected data plus mask.
 
         Parameters
@@ -1163,7 +1322,7 @@ class TargetPCA(ArtCorrection):
             Channel selection mode.
         all_epochs : str, default='all'
             Epoch selection mode.
-        splice_method : {'trend', 1} | None, default='trend'
+        splice_method : {1, 'trend'} | None, default=1
             Splicing method for corrected segments.
 
         Returns
@@ -1302,7 +1461,9 @@ class TargetPCA(ArtCorrection):
                         # samples are taken from bad_if
                         d = _splice_segments(d, bad_if, epoch_if, bct=BCT[el, :], method=splice_method,
                                              window=int(round(1.0 * raw.info['sfreq'])),
-                                             guard=int(round(0.02 * raw.info['sfreq'])))
+                                             guard=int(round(0.02 * raw.info['sfreq'])),
+                                             step_window=int(round(2.0 * raw.info['sfreq'])),
+                                             null_step=int(round(0.1 * raw.info['sfreq'])))
     
                     # Store the data
                     data_pca[el, :] = d
@@ -1514,7 +1675,7 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
         Mask duration in seconds around bad segments.
     min_segment_time : float, default=0.200
         Minimum segment length in seconds for rejection regularization.
-    splice_method : {'trend', 1} | None, default='trend'
+    splice_method : {1, 'trend'} | None, default=1
         Splicing method after interpolation.
     save_corrected : bool, default=True
         Whether to update correction masks in ``raw.artifacts``.
@@ -1525,7 +1686,7 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
     """
 
     def __init__(self, n_jobs=-1, p=0.5, p_neighbors=1, min_good_time=1.00, min_intertime=0.100, mask_time=0.100, 
-                 min_segment_time=0.200, splice_method='trend', save_corrected=True, verbose=True,
+                 min_segment_time=0.200, splice_method=1, save_corrected=True, verbose=True,
                  parallelize_mode='auto'):
         
         super().__init__(verbose=verbose)
@@ -1779,7 +1940,9 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
                                             method=self.params['splice_method'],
                                             corrected=int_i,
                                             window=int(round(1.0 * sfreq)),
-                                            guard=int(round(0.02 * sfreq)))
+                                            guard=int(round(0.02 * sfreq)),
+                                            step_window=int(round(2.0 * sfreq)),
+                                            null_step=int(round(0.1 * sfreq)))
                 interpolatedData[ep,:,:] = dspliced
            
         # reshape if necessary         

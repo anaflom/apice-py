@@ -114,6 +114,99 @@ def test_method1_ramp_stays_within_the_bad_run():
     np.testing.assert_array_equal(out[:100], 0.0)
 
 
+# ------------------------------------------------------------- adaptive
+def _splice(y, segs, method, n=None, **kw):
+    n = y.size if n is None else n
+    kw.setdefault("window", SF)
+    kw.setdefault("guard", 5)
+    kw.setdefault("step_window", 2 * SF)
+    kw.setdefault("null_step", SF // 10)
+    return np.squeeze(_splice_segments(y, np.array(segs), np.array([0, n]), method=method, **kw))
+
+
+def _step_case(seed=4, jump=200e-6, tail=0, corrected_by="spline"):
+    """Step artifact as in the user's sketch: the baseline jumps and stays
+    high; only the jump itself is marked (corrected). ``tail``: samples of the
+    jump left unmarked after the segment (imperfect detection).
+
+    corrected_by='spline': the segment was replaced by an estimate at some
+    other level (no jump inside). 'pca': target PCA did not remove the jump,
+    which is still inside the segment."""
+    x = _clean(seed=seed)
+    I, F = 2000, 2025                          # 100 ms marked around the jump
+    y = x.copy()
+    if corrected_by == "spline":
+        y[I:F] += 50e-6                        # interpolated, at a wrong level
+    else:
+        y[I:F] += np.linspace(0, jump, F - I)  # the jump is still there
+    y[F:] += jump                              # the offset that stays
+    y[F:F + tail] += 100e-6                    # unmarked end of the jump
+    return x, y, I, F
+
+
+def _rms(a):
+    return np.sqrt(np.mean(a ** 2))
+
+
+def test_adaptive_removes_a_step_like_method1_and_unlike_trend():
+    x, y, I, F = _step_case()
+    after = slice(F + 50, None)
+    m1 = _splice(y, [[I, F]], 1)
+    tr = _splice(y, [[I, F]], "trend")
+    ad = _splice(y, [[I, F]], "adaptive")
+    assert _rms(tr[after] - x[after]) > 150e-6     # trend leaves the offset
+    assert _rms(m1[after] - x[after]) < 30e-6
+    assert _rms(ad[after] - x[after]) < 15e-6
+    np.testing.assert_array_equal(ad[:I], y[:I])   # data before the step untouched
+
+
+def test_adaptive_removes_a_step_that_target_pca_did_not_correct():
+    """The jump is still inside the corrected segment (e.g. target PCA could
+    not remove it): method 1 aligns the next data to the segment end, so the
+    offset stays; the adaptive method compares the levels outside."""
+    x, y, I, F = _step_case(corrected_by="pca")
+    after = slice(F + 50, None)
+    m1 = _splice(y, [[I, F]], 1)
+    ad = _splice(y, [[I, F]], "adaptive")
+    assert _rms(m1[after] - x[after]) > 150e-6
+    assert _rms(ad[after] - x[after]) < 15e-6
+
+
+def test_adaptive_step_robust_to_missed_jump_end():
+    x, y, I, F = _step_case(tail=8)                # 32 ms of the jump not marked
+    after = slice(F + 50, None)
+    m1 = _splice(y, [[I, F]], 1)
+    ad = _splice(y, [[I, F]], "adaptive")
+    assert _rms(ad[after] - x[after]) < 15e-6
+    assert _rms(ad[after] - x[after]) < 0.5 * _rms(m1[after] - x[after])
+
+
+def test_adaptive_transient_artifact_leaves_good_data_untouched():
+    """Not a step: behaves as 'trend' (segment-only)."""
+    x = _clean(seed=5)
+    I, F = 2000, 2250
+    y = _corrupt(x, I, F)
+    ad = _splice(y, [[I, F]], "adaptive")
+    tr = _splice(y, [[I, F]], "trend")
+    np.testing.assert_array_equal(ad, tr)
+
+
+def test_adaptive_null_uses_only_good_data():
+    """Large artifacts elsewhere, marked as bad, must not change the decision
+    (the null distribution is built from good data only)."""
+    x = _clean(seed=6)
+    I, F = 2000, 2250
+    y = _corrupt(x, I, F)
+    bct = np.zeros(x.size, bool)
+    bct[3000:3500] = True
+    y_noisy = y.copy()
+    y_noisy[3000:3500] += np.random.default_rng(0).normal(0, 300e-6, 500).cumsum() / 10
+    a = _splice(y, [[I, F]], "adaptive", bct=bct)
+    b = _splice(y_noisy, [[I, F]], "adaptive", bct=bct)
+    good = ~bct
+    np.testing.assert_allclose(a[good], b[good], rtol=0, atol=1e-15)
+
+
 def test_unknown_method_raises():
     with pytest.raises(ValueError):
         _splice_segments(np.zeros(10), np.array([[2, 4]]), np.array([0, 10]), method=7)

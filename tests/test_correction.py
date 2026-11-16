@@ -59,7 +59,7 @@ def _typical_step(x):
     return np.percentile(np.abs(np.diff(x)), 99)
 
 
-@pytest.mark.parametrize("method", [1, "trend"])
+@pytest.mark.parametrize("method", [1, "trend", "adaptive"])
 @pytest.mark.parametrize("placement", ["start", "end", "between", "one_bad_boundary"])
 def test_spline_segments_no_edge_discontinuity(placement, method):
     """Method 1 makes edges continuous by construction (strict tolerance).
@@ -85,7 +85,7 @@ def test_spline_segments_no_edge_discontinuity(placement, method):
         x = after[ch]
         tol = 2 * _typical_step(before[ch, ~truth.mask[ch]])
         assert OFFSET > 5 * tol, "test would not detect a missing realignment"
-        if method == "trend":
+        if method in ("trend", "adaptive"):
             tol = OFFSET / 4
         edges = _edges(cct[ch])
         assert len(edges) >= 1
