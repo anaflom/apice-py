@@ -8,17 +8,24 @@ parameter dictionaries passed to ``ArtifactsConfiguration`` and executed within
 the main artifact rejection pipeline.
 """
 
+import numbers
 import numpy as np
+from mne.time_frequency import psd_array_multitaper
 from scipy import interpolate
 from scipy.stats import yeojohnson
 import warnings
 
 
 from apice.utils import (get_data_size,
-                         mask_bad_segments, 
-                         include_short_bad_segments, 
+                         mask_bad_segments,
+                         include_short_bad_segments,
                          reject_short_good_segments,
 )
+
+
+def _is_number(x):
+    """True for a real scalar (Python or numpy int/float), False for bools and sequences."""
+    return isinstance(x, numbers.Real) and not isinstance(x, (bool, np.bool_))
 
 
 # %% CLASSES FOR ARTIFACTS DETECTION
@@ -708,8 +715,12 @@ class CrossElectrodesOutlier(DetectionMethod):
         self._steps_pre_reject()
         
         
-        # Reject data 
-        bct, rl_sum, ru_sum = reject_data(self._data.copy(), raw, self.params_reject['thresh'], rejection='absolute')
+        # Reject data. The measure is one-sided (large deviation = outlier),
+        # so a single number is used as the upper threshold only.
+        thresh = self.params_reject['thresh']
+        if _is_number(thresh):
+            thresh = [None, thresh]
+        bct, rl_sum, ru_sum = reject_data(self._data.copy(), raw, thresh, rejection='absolute')
         
         # steps after rejection
         bct, raw = self._steps_post_reject(raw, bct, show_rej={'threshold': ru_sum})
@@ -726,11 +737,11 @@ class CrossElectrodesOutlier(DetectionMethod):
             i_t, time_tw = define_time_window(raw, time_window,time_window_step)
             n_tw = np.shape(i_t)[1]
         else:
-            i_t = np.arange(0,n_samples)
+            i_t = np.arange(0,n_samples)[:, np.newaxis]  # one window, 2-D like define_time_window
             n_tw = 1
-            
+
         # get the data
-        eeg_data = raw._data.copy()  
+        eeg_data = raw._data.copy()
         bct = raw.artifacts.BCT.copy()
         if len(np.shape(raw._data))==2:
             eeg_data = np.reshape(eeg_data, (n_epochs, n_channels, n_samples))
@@ -864,12 +875,14 @@ class Power(DetectionMethod):
         powerband_tw = np.empty((n_epochs, n_channels, n_tw))
         powerband_tw[:] = np.nan
 
-        # compute
-        raw_mne = raw.to_mne_raw(annotate_channels=False, annotate_times=False, annotate_data=False, annotate_corrected=False)
+        # compute the multitaper PSD of each window directly on the data array
+        # (works for raw (ch, t) and epochs (ep, ch, t); same defaults as
+        # Raw.compute_psd(method='multitaper'))
+        data = raw._data
         for i in range(n_tw):
-            dat = raw_mne.copy().crop(tmin=raw.times[i_t[0,i]], tmax=raw.times[i_t[-1,i]], verbose='ERROR')
-            spc = dat.compute_psd(method='multitaper', fmin=freq_band[0], fmax=freq_band[1], verbose='ERROR')
-            p = spc.get_data()
+            seg = data[..., i_t[0,i]:i_t[-1,i]+1]
+            p, _ = psd_array_multitaper(seg, raw.info['sfreq'], fmin=freq_band[0], fmax=freq_band[1],
+                                        verbose='ERROR')
             if len(np.shape(raw._data))==2:
                 m = np.mean(p, axis=1)
                 # p_band = np.where(m > 0, np.log10(np.maximum(m, np.finfo(float).tiny)), np.nan)
@@ -1465,12 +1478,14 @@ def define_time_window(raw, time_window, time_window_step):
     n_channels, n_samples, n_epochs = get_data_size(raw)
 
     time_window = int(np.round(time_window * raw.info['sfreq']))
-    time_window_step = int(np.round(time_window_step * raw.info['sfreq']))
+    time_window_step = max(1, int(np.round(time_window_step * raw.info['sfreq'])))
     n_time_window = int(np.round((n_samples - time_window + 1) / time_window_step) + 1)
-    if n_time_window <= 0:
-        warnings.warn('The time window is too long.')
+    if time_window >= n_samples or n_time_window <= 0:
+        # window longer than the data: use the whole data as a single window
+        warnings.warn('The time window is longer than the data; using a single window.')
         i_t = np.arange(0,n_samples)
         i_t = i_t[:,np.newaxis]
+        time_window = n_samples
     else:
         # Indices of the window limits
         i_t = np.asarray((np.round(np.linspace(0, n_samples - time_window, n_time_window))), dtype=int)
@@ -1602,13 +1617,13 @@ def reject_relative_per_cha(data, art, thresh, iq_half=False, remove_bt=True, re
     """
         
     if iq_half:
-        if type(thresh)==float or type(thresh)==int:
+        if _is_number(thresh):
             thresh= [thresh]
         if len(thresh)>1:
             raise Exception("a unique threshold is required when using iq_half=True")
         
     else:
-        if type(thresh)==float or type(thresh)==int:
+        if _is_number(thresh):
             raise Exception("two thresholds are required")
         if len(thresh)!=2:
             raise Exception("two thresholds are required")
@@ -1706,13 +1721,13 @@ def reject_relative(data, art, thresh, iq_half=False, remove_bt=True, remove_bct
     """
         
     if iq_half:
-        if type(thresh)==float or type(thresh)==int:
+        if _is_number(thresh):
             thresh= [thresh]
         if len(thresh)>1:
             raise Exception("a unique threshold is required when using iq_half=True")
         
     else:
-        if type(thresh)==float or type(thresh)==int:
+        if _is_number(thresh):
             raise Exception("two thresholds are required")
         if len(thresh)!=2:
             raise Exception("two thresholds are required")
@@ -1804,14 +1819,14 @@ def reject_absolute(data, thresh, iq_half=False):
     """
         
     if iq_half:
-        if type(thresh)==float or type(thresh)==int:
+        if _is_number(thresh):
             thresh= [thresh]
         if len(thresh)>1:
             raise Exception("a unique threshold is required when using iq_half=True")
         if not thresh[0]:
             thresh[0] = np.inf
     else:
-        if type(thresh)==float or type(thresh)==int:
+        if _is_number(thresh):
             raise Exception("two thresholds are required")
         if len(thresh)!=2:
             raise Exception("two thresholds are required")
@@ -1956,12 +1971,14 @@ def _set_reference(raw, bad_data=None):
         eeg_data = raw._data.copy() - np.tile(reference, (n_channels, 1))
     
     else:
+        # one reference time course per epoch: shape (n_epochs, n_samples),
+        # as expected by _return_data_after_referencing
         eeg_data = raw._data.copy()
+        reference = np.zeros((n_epochs, n_samples))
         for ep in range(n_epochs):
-            reference = np.zeros(good_data.shape[1])
             idx_t_good = np.sum(np.isnan(good_data[ep])==False, axis=0)>1
-            reference[idx_t_good] = np.nanmean(good_data[ep][:, idx_t_good], axis=0)
-            eeg_data[ep] = eeg_data[ep] - np.tile(reference, (n_channels, 1))
+            reference[ep, idx_t_good] = np.nanmean(good_data[ep][:, idx_t_good], axis=0)
+            eeg_data[ep] = eeg_data[ep] - reference[ep][np.newaxis, :]
     
     raw._data = eeg_data.copy()
     if np.isnan(reference).any():
@@ -1988,10 +2005,8 @@ def _compute_z_score(raw, bad_data=None):
         Standard deviation per channel (for restoring original scale).
     """
 
-    warnings.filterwarnings("ignore")
-
     n_channels, n_samples, n_epochs = get_data_size(raw)
-    
+
     # Remove bad data
     good_data = remove_bad_data(raw, bad_data=bad_data)
 
@@ -1999,11 +2014,17 @@ def _compute_z_score(raw, bad_data=None):
     if len(np.shape(good_data))==3:
         good_data = np.transpose(good_data,(1,2,0))
     good_data = np.reshape(good_data, (n_channels, n_samples * n_epochs))
-    sd = np.nanstd(good_data, axis=1)
-    sd[np.isnan(sd)] = np.nanmean(sd)
+    with warnings.catch_warnings():
+        # all-NaN channels (fully rejected) are handled just below
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        sd = np.nanstd(good_data, axis=1)
+        sd[np.isnan(sd)] = np.nanmean(sd)
+    # A flat channel has sd == 0; dividing by it would turn the channel into
+    # NaN permanently (restoring multiplies NaN by 0). Leave it unscaled.
+    sd[~np.isfinite(sd) | (sd <= 0)] = 1.0
 
     # Reshape and replicate variables
-    if len(np.shape(good_data))==3:
+    if len(np.shape(raw._data))==3:
         sd_ = np.reshape(sd, (1, n_channels, 1))
         sd_ = np.tile(sd_, (n_epochs, 1, n_samples))
     else:    
