@@ -21,8 +21,25 @@ dependencies = [
     "tabulate>=0.9.0",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+markers = [
+    "slow: long-running end-to-end tests (deselect with -m 'not slow')",
+]
+addopts = "-ra"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::RuntimeWarning",
+]
 
 [tool.setuptools.package-data]
 apice = ["default_cfg/*.json"]
