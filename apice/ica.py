@@ -138,6 +138,20 @@ def find_ica_components_correlation(ica, raw,
 
 
 
+def _ica_artifact_estimate(ica, inst, components):
+    """Return a copy of ``inst`` holding only the signal of ``components``.
+
+    Computed as ``inst - ica.apply(inst, exclude=components)``. Note that
+    ``ica.apply(inst, include=components, n_pca_components=None)`` is NOT the
+    same: it also keeps the PCA dimensions the ICA did not model, so
+    subtracting it from the data removed real signal as well.
+    """
+    cleaned = ica.apply(inst.copy(), exclude=list(components), n_pca_components=None)
+    artifacts = inst.copy()
+    artifacts._data = inst._data - cleaned._data
+    return artifacts
+
+
 def clean_ica(raw,
               cfg_artifacts_detection=None,
               cfg_bcbt=None,
@@ -579,8 +593,7 @@ def clean_ica(raw,
         raw_ref_ica = raw
     raw_clean = raw.copy()
     if len(components_to_exclude) > 0:
-        artifacts = raw_ref_ica.copy()
-        ica.apply(artifacts, include=components_to_exclude, exclude=[], n_pca_components=None)
+        artifacts = _ica_artifact_estimate(ica, raw_ref_ica, components_to_exclude)
         picks_fit = mne.pick_channels(raw.ch_names, include=ica.ch_names, ordered=False)
         if original_ref_channels is not None:
             raw_clean = raw_ref_ica.copy()
