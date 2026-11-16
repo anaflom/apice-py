@@ -1396,7 +1396,7 @@ class EpochsAPICE(mne.EpochsArray):
                 self.artifacts.rejection_reasons[ep].add(reason)
 
     def define_bad_epochs_artifacts(self, bad_data = 1, bad_time = 0, bad_channel = 0.3,
-                        tmin=[], tmax=[], keeppre=True):
+                        tmin=None, tmax=None, keeppre=True):
         """Flag bad epochs using artifact-mask proportions.
 
         Parameters
@@ -1407,10 +1407,13 @@ class EpochsAPICE(mne.EpochsArray):
             Maximum allowed ``BT`` proportion per epoch.
         bad_channel : float, default=0.3
             Maximum allowed ``BC`` proportion per epoch.
-        tmin : float | list, default=[]
-            Start time (seconds) of evaluation window.
-        tmax : float | list, default=[]
-            End time (seconds) of evaluation window.
+        tmin : float | None, default=None
+            Start time (seconds) of evaluation window. None (or an empty
+            list, for backward compatibility) uses the first epoch sample.
+            ``0`` is a valid value.
+        tmax : float | None, default=None
+            End time (seconds) of evaluation window. None (or an empty list)
+            uses the last epoch sample. ``0`` is a valid value.
         keeppre : bool, default=True
             If True, keep previously flagged bad epochs.
 
@@ -1426,9 +1429,9 @@ class EpochsAPICE(mne.EpochsArray):
         n_electrodes, n_samples, n_epochs = self.get_data_size()
 
         # Find the times to consider
-        if not tmin:
+        if tmin is None or (isinstance(tmin, (list, tuple)) and len(tmin) == 0):
             tmin = self.times[0]
-        if not tmax:
+        if tmax is None or (isinstance(tmax, (list, tuple)) and len(tmax) == 0):
             tmax = self.times[-1]
         idx_t = (self.times >= tmin) & (self.times <= tmax)
         n_samples = np.sum(idx_t)
@@ -1510,7 +1513,8 @@ class EpochsAPICE(mne.EpochsArray):
         
         print('\nIdentifying bad epochs based on the distance to the average ERP...')
 
-        if not lim_bad_time_dist:
+        # None -> default (100 ms worth of samples); 0 disables this criterion
+        if lim_bad_time_dist is None:
             lim_bad_time_dist = 0.10/(self.times[-1]-self.times[0])  # 100 ms
         
         if not where:
@@ -1553,16 +1557,18 @@ class EpochsAPICE(mne.EpochsArray):
             data = data[:,:,idxtime]
             data_avg = data_avg[:,:,idxtime]
             
-            # remove the mean
+            # remove the per-epoch, per-channel temporal mean (from both the
+            # single trials and the data used to build the average)
             if rmvmean:
-                data_avg = data_avg - np.tile(np.mean(data_avg,axis=2), (1, 1, n_smpl))
-                
-            # reject epochs having samples that are too far from the average    
+                data = data - np.nanmean(data, axis=2, keepdims=True)
+                data_avg = data_avg - np.nanmean(data_avg, axis=2, keepdims=True)
+
+            # reject epochs having samples that are too far from the average
             be = be_old.copy()
             ok = False
             ci = 1
             be_dist = np.full(n_epochs, False)
-            while (~ok and ci<=maxloops and np.any(be==0)):
+            while (not ok) and ci<=maxloops and np.any(~be):
                 
                 M = np.nanmean(data_avg[~be,:,:], axis=0)
                 
@@ -1623,7 +1629,7 @@ class EpochsAPICE(mne.EpochsArray):
                         threshMaxD = perc[1] + lim_max_dist*(perc[1]-perc[0])
                     else:
                         threshMaxD = lim_max_dist
-                    Rmax = np.mean(D,axis=1) > threshMaxD
+                    Rmax = np.max(D,axis=1) > threshMaxD
                 else:
                     Rmax = np.full(n_epochs, False)
                     
@@ -1693,7 +1699,8 @@ class EpochsAPICE(mne.EpochsArray):
         
         print('\nIdentifying bad epochs based on the GFP...')
 
-        if not lim_bad_time_gfp:
+        # None -> default (100 ms worth of samples); 0 disables this criterion
+        if lim_bad_time_gfp is None:
             lim_bad_time_gfp = 0.10/(self.times[-1]-self.times[0])  # 100 ms
         
         if not where:
@@ -1776,7 +1783,7 @@ class EpochsAPICE(mne.EpochsArray):
                     threshMaxGFP = perc[1] + lim_max_gfp*(perc[1]-perc[0])
                 else:
                     threshMaxGFP = lim_max_gfp
-                Rmax = np.mean(GFP,axis=1) > threshMaxGFP
+                Rmax = np.max(GFP,axis=1) > threshMaxGFP
             else:
                 Rmax = np.full(n_epochs, False)
                 
