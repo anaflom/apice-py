@@ -120,7 +120,7 @@ def _splice(y, segs, method, n=None, **kw):
     kw.setdefault("window", SF)
     kw.setdefault("guard", 5)
     kw.setdefault("step_window", 4 * SF)
-    kw.setdefault("step_min", SF)
+    kw.setdefault("step_min", SF // 20)
     kw.setdefault("null_step", SF // 10)
     return np.squeeze(_splice_segments(y, np.array(segs), np.array([0, n]), method=method, **kw))
 
@@ -267,10 +267,10 @@ def test_adaptive_reports_its_decisions():
 
 
 def _undecidable_step_case():
-    """A step with too little data before it to estimate the level (the
-    segment starts 1 s into the epoch, the level window is 2 s)."""
+    """A step with too little clean data before it to estimate the level
+    (the segment starts 8 samples into the epoch; shortest window 12)."""
     x, y, _, _ = _step_case(seed=10)
-    I, F = SF, SF + 25
+    I, F = 8, 8 + 25
     y = x.copy()
     y[I:F] += 50e-6
     y[F:] += 200e-6
@@ -328,6 +328,31 @@ def test_level_windows_do_not_cross_other_artifacts():
     ok[I:F] = False
     before = slice(I - 75, I)                          # good data between the two
     np.testing.assert_array_equal(ad[before], y[before])
+
+
+def test_matched_reference_decides_with_many_short_marks():
+    """Many short per-channel bad marks (as in infant data) leave little
+    contiguous clean data; the matched reference still decides, with short
+    windows, and finds a large step."""
+    x, y, I, F = _step_case(seed=13, jump=200e-6)
+    rng = np.random.default_rng(0)
+    bct = np.zeros(y.size, bool)
+    t = 50
+    while t < y.size - 50:
+        t += int(rng.uniform(0.3, 1.0) * SF)          # a mark every 0.3-1 s
+        if not (I - 30 < t < F + 30):
+            bct[t:t + int(rng.uniform(0.02, 0.2) * SF)] = True
+    st = {}
+    ad = _splice(y, [[I, F]], "adaptive", bct=bct, stats=st)
+    assert st["undecidable"] < 0.2 * sum(st.values())
+    after = slice(F + 30, None)
+    good = ~bct[after]
+    assert _rms((ad[after] - x[after])[good]) < 40e-6      # the 200 uV step is removed
+
+
+def test_matched_windows():
+    from apice.artifacts_correction import _matched_windows
+    assert _matched_windows(1000, 12) == [1000, 500, 250, 125, 62, 31, 15, 12]
 
 
 def test_contiguous_good_counts():

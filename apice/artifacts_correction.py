@@ -59,7 +59,7 @@ SPLICE_METHODS = (1, 'trend', 'adaptive')
 
 def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=1,
                      corrected=None, window=250, guard=5, order=1, align_bad_times=True,
-                     step_window=1000, step_min=250, step_k=2.5, null_step=25,
+                     step_window=1000, step_min=12, step_k=2.5, null_step=25,
                      anchor='sample', anchor_window=25, undecidable='method1', stats=None):
     """Splice corrected segments to reduce discontinuities at segment borders.
 
@@ -97,12 +97,12 @@ def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=
           slow waves, replacing the segment's trend removes real activity
           inside it (splicing study 2026-11). See ``_splice_segments_trend``.
         - ``'adaptive'``: decides for each non-good run (corrected, bad or
-          bad time) whether it is a step, by comparing the level of the good
-          data before and after it (contiguous good data, up to
-          ``step_window`` samples per side, at least ``step_min``) with the
-          variability of such before/after differences in GOOD data of the
-          same channel (all-good gap of the same length, windows chosen with
-          the same rule). Steps: the data after the run are
+          bad time) whether it is a step, by comparing the difference between
+          the mean of the good data after and before it (windows of the
+          largest length w, from ``step_window`` down to ``step_min``, that
+          fits on both sides) with a matched reference: the same difference,
+          same w and same gap, at all positions of contiguous GOOD data of
+          the same channel (threshold: ``step_k`` robust SDs). Steps: the data after the run are
           shifted to the level before it (as method 1, but with robust
           levels, not single samples). Then the corrected samples are aligned
           at their edges, keeping their own shape (as MATLAB method 3; see
@@ -124,12 +124,13 @@ def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=
         surrounding good data (they stay marked as bad; this only reduces how
         much a later high-pass spreads their offset into good data).
     step_window : int, default=1000
-        ``'adaptive'``: maximum samples per side used to estimate the level
-        before and after a segment: the contiguous good data next to it,
-        stopping at neighbouring artifacts (callers pass ~4 s).
-    step_min : int, default=250
-        ``'adaptive'``: minimum contiguous good samples needed on each side
-        to decide (callers pass ~1 s); same rule for the null distribution.
+        ``'adaptive'``: longest window (samples per side) for the levels
+        before and after a run (callers pass ~4 s); halved until it fits in
+        the contiguous good data on both sides and enough reference spans
+        exist.
+    step_min : int, default=12
+        ``'adaptive'``: shortest window allowed (callers pass ~50 ms);
+        shorter clean data -> 'undecidable'.
     undecidable : {'method1', 'edges'}, default='method1'
         ``'adaptive'``, when there is not enough good data to decide:
         'method1' splices that run as method 1 (offset to the data before;
@@ -363,43 +364,46 @@ def _contiguous_good(ok):
     return before, after
 
 
-def _step_null_sd(cs_x, good_before, good_after, starts, ends, gap, window, min_win, guard,
-                  null_step, min_null=20):
-    """Robust SD of before/after level differences across a gap of ``gap``
-    samples, using contiguous good data only (the same rule as the levels).
+def _step_null_sd(cs_x, good_after, starts, ends, gap, w, guard, null_step, min_null=20):
+    """Robust SD of the matched before/after level difference in good data.
 
-    Positions (gap start) every ``null_step`` samples within each epoch. A
-    position is used if the gap and both guards are entirely good and, on
-    each side, the contiguous good data next to the guard (up to ``window``
-    samples, within the epoch) has at least ``min_win`` samples. Levels are
-    the means of those windows. Returns None if fewer than ``min_null``
-    positions qualify.
+    The reference is computed exactly as the observed difference across a
+    run of ``gap`` samples: mean of the ``w`` samples after the gap (after a
+    ``guard``) minus mean of the ``w`` samples before it (before a
+    ``guard``). Positions are taken every ``null_step`` samples within each
+    epoch, and only where the whole span (``w``, guard, gap, guard, ``w``) is
+    contiguous good data, so no artifact (and no step) is ever included.
+    The spread is a robust SD (1.4826 x MAD), which does not assume that
+    outliers are present. Returns None if fewer than ``min_null`` positions
+    qualify.
     """
+    span = 2 * w + 2 * guard + gap
     pos = []
     for ei, ef in zip(starts, ends):
-        lo, hi = ei + guard + min_win, ef - gap - guard - min_win
-        if hi >= lo:
-            pos.append(np.arange(lo, hi + 1, max(int(null_step), 1)))
+        if ef - ei >= span:
+            pos.append(np.arange(ei, ef - span + 1, max(int(null_step), 1)))
     if not pos:
         return None
-    p = np.concatenate(pos)
-    e_start = np.zeros_like(p)
-    e_end = np.zeros_like(p)
-    for ei, ef in zip(starts, ends):
-        inside = (p >= ei) & (p < ef)
-        e_start[inside], e_end[inside] = ei, ef
-    lb = p - guard                                   # left window ends here (exclusive)
-    r0 = p + gap + guard                             # right window starts here
-    clean_gap = good_after[lb] >= gap + 2 * guard
-    L = np.minimum(np.minimum(good_before[lb], window), lb - e_start)
-    R = np.minimum(np.minimum(good_after[np.minimum(r0, good_after.size - 1)], window), e_end - r0)
-    use = clean_gap & (L >= min_win) & (R >= min_win)
-    if use.sum() < min_null:
+    a = np.concatenate(pos)
+    a = a[good_after[a] >= span]
+    if a.size < min_null:
         return None
-    lb, r0, L, R = lb[use], r0[use], L[use], R[use]
-    d = (cs_x[r0 + R] - cs_x[r0]) / R - (cs_x[lb] - cs_x[lb - L]) / L
+    r0 = a + w + 2 * guard + gap
+    d = (cs_x[r0 + w] - cs_x[r0]) / w - (cs_x[a + w] - cs_x[a]) / w
     mad = np.median(np.abs(d - np.median(d)))
     return 1.4826 * mad if mad > 0 else None
+
+
+def _matched_windows(w_max, w_min):
+    """Window lengths tried for the matched reference: w_max, halved down to w_min."""
+    ws = []
+    w = int(w_max)
+    while w >= max(int(w_min), 1):
+        ws.append(w)
+        w //= 2
+    if not ws or ws[-1] != int(w_min):
+        ws.append(max(int(w_min), 1))
+    return sorted(set(ws), reverse=True)
 
 
 SPLICE_STEP_DECISIONS = ('step', 'no_step', 'undecidable')
@@ -407,23 +411,26 @@ SPLICE_STEP_DECISIONS = ('step', 'no_step', 'undecidable')
 
 def _splice_segments_adaptive(data, bad_if, epoch_if, bct=None, bt=None, bc=None, corrected=None,
                               window=250, guard=5, order=1, align_bad_times=True,
-                              step_window=1000, step_min=250, step_k=2.5, null_step=25,
+                              step_window=1000, step_min=12, step_k=2.5, null_step=25,
                               anchor='sample', anchor_window=25, undecidable='method1',
-                              stats=None, min_side=3):
+                              stats=None, min_side=3, min_null=20):
     """Step-aware splicing (see ``_splice_segments``, method ``'adaptive'``).
 
     Per channel, every run of non-good samples (corrected, bad or bad time),
     split at epoch limits, is examined in time order:
 
-    1. Step decision. Levels: means of the contiguous good data next to the
-       run (skipping ``guard``), up to ``step_window`` samples on each side
-       and stopping at the neighbouring non-good runs and the epoch limits;
-       each side needs at least ``step_min`` samples. Their difference is
-       compared with the null distribution of the same difference across a
-       gap of the same length, at positions where the gap is entirely good
-       and the contiguous good data on each side, computed the same way, has
-       at least ``step_min`` samples (``_step_null_sd``; good data of that
-       channel only, within an epoch).
+    1. Step decision with a matched reference. Window w: the largest of
+       ``step_window``, ``step_window``/2, ... down to ``step_min`` that fits
+       in the contiguous good data on BOTH sides of the run (after a
+       ``guard``, stopping at neighbouring non-good runs and epoch limits).
+       Observed difference: mean of the w samples after the run minus mean
+       of the w samples before it. Reference: the same difference, with the
+       same w, guard and gap, at all positions of the channel where the
+       whole span is contiguous good data (``_step_null_sd``); if fewer than
+       ``min_null`` positions exist, w is halved again. Long clean stretches
+       thus give sensitive, low-noise windows, while short ones (e.g. many
+       short bad marks) still allow a decision with short windows and a
+       reference that is noisier in the same way.
        |difference| > ``step_k`` robust SDs: 'step', and all the data after
        the run, up to the end of the epoch, are shifted by -difference.
        Otherwise 'no_step'. If the levels or the null cannot be computed:
@@ -468,14 +475,14 @@ def _splice_segments_adaptive(data, bad_if, epoch_if, bct=None, bt=None, bc=None
             stats.setdefault(key, 0)
 
     dN = data_.copy()
-    need = max(min_side, int(step_min))
+    w_list = _matched_windows(step_window, max(min_side, int(step_min)))
     for ch in range(n_ch):
         if bc[ch]:
             continue
         ok = ~(np.logical_or(bct[ch], bt) | corrected[ch])
         x = dN[ch]
         cs_x, cs_n = _good_window_sums(x, ok)
-        good_before, good_after = _contiguous_good(ok)
+        _, good_after = _contiguous_good(ok)
         null_cache = {}
         runs = _true_runs(~ok)
         for k, (I, F) in enumerate(runs):
@@ -489,31 +496,35 @@ def _splice_segments_adaptive(data, bad_if, epoch_if, bct=None, bt=None, bc=None
                 e = epoch_of[i0]
                 ei, ef = starts[e], ends[e]
 
-                # 1. step decision on the good data before / after the run
+                # 1. step decision with a matched reference
                 decision = 'undecidable'
-                la, lb = max(i0 - guard - step_window, ei, prev_end), i0 - guard
-                ra, rb = f0 + guard, min(f0 + guard + step_window, ef, next_start)
-                if lb > la and rb > ra:
-                    n_l, n_r = cs_n[lb] - cs_n[la], cs_n[rb] - cs_n[ra]
-                    if n_l >= need and n_r >= need:
-                        gap = f0 - i0
-                        if gap not in null_cache:
-                            null_cache[gap] = _step_null_sd(cs_x, good_before, good_after,
-                                                            starts, ends, gap, step_window,
-                                                            need, guard, null_step)
-                        sd = null_cache[gap]
-                        if sd is not None:
-                            diff = (cs_x[rb] - cs_x[ra]) / n_r - (cs_x[lb] - cs_x[la]) / n_l
-                            if abs(diff) > step_k * sd:
-                                decision = 'step'
-                                x[f0:ef] -= diff
-                                # null positions lie inside single stretches
-                                # of good data, so a constant shift after a
-                                # non-good run never changes them: the cache
-                                # stays valid
-                                cs_x, cs_n = _good_window_sums(x, ok)
-                            else:
-                                decision = 'no_step'
+                lb = i0 - guard                        # left window ends here
+                ra = f0 + guard                        # right window starts here
+                avail_l = lb - max(ei, prev_end)
+                avail_r = min(ef, next_start) - ra
+                avail = min(avail_l, avail_r)
+                gap = f0 - i0
+                for w in w_list:
+                    if w > avail:
+                        continue
+                    key = (gap, w)
+                    if key not in null_cache:
+                        null_cache[key] = _step_null_sd(cs_x, good_after, starts, ends, gap, w,
+                                                        guard, null_step, min_null=min_null)
+                    sd = null_cache[key]
+                    if sd is None:
+                        continue                       # too few clean spans: shorter w
+                    diff = (cs_x[ra + w] - cs_x[ra]) / w - (cs_x[lb] - cs_x[lb - w]) / w
+                    if abs(diff) > step_k * sd:
+                        decision = 'step'
+                        x[f0:ef] -= diff
+                        # reference spans lie inside single stretches of good
+                        # data, so a constant shift after a non-good run never
+                        # changes them: the cache stays valid
+                        cs_x, cs_n = _good_window_sums(x, ok)
+                    else:
+                        decision = 'no_step'
+                    break
                 if stats is not None:
                     stats[decision] += 1
 
@@ -1665,7 +1676,7 @@ class TargetPCA(ArtCorrection):
                                              window=int(round(1.0 * raw.info['sfreq'])),
                                              guard=int(round(0.02 * raw.info['sfreq'])),
                                              step_window=int(round(4.0 * raw.info['sfreq'])),
-                                             step_min=int(round(1.0 * raw.info['sfreq'])),
+                                             step_min=int(round(0.05 * raw.info['sfreq'])),
                                              step_k=splice_step_k,
                                              null_step=int(round(0.1 * raw.info['sfreq'])),
                                              anchor_window=int(round(0.1 * raw.info['sfreq'])),
@@ -2157,7 +2168,7 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
                                             window=int(round(1.0 * sfreq)),
                                             guard=int(round(0.02 * sfreq)),
                                             step_window=int(round(4.0 * sfreq)),
-                                            step_min=int(round(1.0 * sfreq)),
+                                            step_min=int(round(0.05 * sfreq)),
                                             step_k=self.params.get('splice_step_k', 2.5),
                                             null_step=int(round(0.1 * sfreq)),
                                             anchor_window=int(round(0.1 * sfreq)),
