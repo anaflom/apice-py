@@ -91,11 +91,22 @@ class RawAPICE(mne.io.RawArray):
         # Copy the internal MNE infrastructure from the source object
         super().__init__(raw._data.copy(), raw.info.copy(), raw.first_samp, verbose=verbose)
 
-        # Set annotations 
-        self.set_annotations(raw.annotations.copy())
-
+        # Set annotations. Annotations attached to a Raw already have onsets
+        # in Raw-time coordinates (first_time included). If the source has no
+        # meas_date, set one first and re-anchor the annotations on it without
+        # shifting them; passing them with orig_time=None would make MNE add
+        # first_time a second time.
+        annotations = raw.annotations.copy()
         if self.info['meas_date'] is None:
             self.set_meas_date(datetime.now(tz=timezone.utc))
+            annotations = mne.Annotations(
+                onset=annotations.onset,
+                duration=annotations.duration,
+                description=annotations.description,
+                ch_names=annotations.ch_names,
+                orig_time=self.info['meas_date'],
+            )
+        self.set_annotations(annotations)
 
         # Set projectors if any
         self._projector = raw._projector
@@ -339,25 +350,29 @@ class RawAPICE(mne.io.RawArray):
             for start, end in zip(starts, ends):
                 self.artifacts.BT[0, start:end] = True
 
+        def _annotation_channel_indices(chs):
+            """Channel indices of one annotation: all channels if it has none,
+            every listed channel otherwise (names absent from the data are skipped)."""
+            if isinstance(chs, str):
+                chs = (chs,)
+            chs = tuple(chs) if chs is not None else ()
+            if len(chs) == 0:
+                return np.arange(len(ch_names))
+            return np.array([np.where(ch_names == ch)[0][0] for ch in chs if ch in ch_names], dtype=int)
+
         # BCT
         bad_data = annotations_df[annotations_df['description'] == bct_label].reset_index(drop=True)
         if len(bad_data):
             starts, ends = _onsets_to_indices(bad_data['onset'], bad_data['duration'])
-            channel_indices = np.array(
-                [np.where(ch_names == ch)[0][0] for ch in bad_data['ch_names']]
-            )
-            for el, start, end in zip(channel_indices, starts, ends):
-                self.artifacts.BCT[el, start:end] = True
+            for chs, start, end in zip(bad_data['ch_names'], starts, ends):
+                self.artifacts.BCT[_annotation_channel_indices(chs), max(start, 0):end] = True
 
         # CCT
         corrected_data = annotations_df[annotations_df['description'] == cct_label].reset_index(drop=True)
         if len(corrected_data):
             starts, ends = _onsets_to_indices(corrected_data['onset'], corrected_data['duration'])
-            channel_indices = np.array(
-                [np.where(ch_names == ch)[0][0] for ch in corrected_data['ch_names']]
-            )
-            for el, start, end in zip(channel_indices, starts, ends):
-                self.artifacts.CCT[el, start:end] = True
+            for chs, start, end in zip(corrected_data['ch_names'], starts, ends):
+                self.artifacts.CCT[_annotation_channel_indices(chs), max(start, 0):end] = True
 
     def remove_artifacts_annotations(self, bt_label='badtime', bct_label='artifact', cct_label='corrected') -> None:
         """Remove artifact-related annotations from the raw object.
@@ -421,25 +436,20 @@ class RawAPICE(mne.io.RawArray):
                             **epoching_kwargs,
                             )
                 
-        # Additional code to handle the rejection matrix and update artifacts in the epochs
-        # Calculate left and right limits for the time window.
-        # Use np.round before int conversion to avoid off-by-one from floating-point
-        # accumulation (e.g. times[0]=-0.19999999 would truncate to 99 instead of 100).
-        samples_start = int(np.round(-epochs.times[0] * self.info['sfreq']))
-        samples_epoch = len(epochs.times)
-        n_raw_samples = self.n_times  # total samples in raw (zero-based)
+        # Apply MNE's own rejection now, so that the retained epochs and their
+        # events are final (with preload=False, len(epochs) is not defined
+        # before this in recent MNE versions).
+        epochs.drop_bad(verbose=False)
 
-        # Extract the stimulus times from the events
-        stimulus_times = events[:, 0]
-
-        # Identify the events to be dropped based on the drop log of epochs
-        stimulus_events_to_drop = []
-        for ep in np.arange(len(epochs.drop_log)):
-            if len(epochs.drop_log[ep]) > 0:
-                stimulus_events_to_drop.append(ep)
-
-        # Update stimulus times by removing the dropped events
-        stimulus_times = np.delete(stimulus_times, stimulus_events_to_drop).astype(int)
+        # Raw sample index of every epoch sample. epochs.events holds the
+        # events of the retained epochs only; epochs.times already accounts
+        # for tmin and for decimation (decim / lowpass-based resampling), so
+        # this maps each epoch sample to the raw sample it was taken from.
+        # np.round avoids off-by-one errors from floating-point times.
+        sfreq_raw = self.info['sfreq']
+        offsets = np.round(epochs.times * sfreq_raw).astype(int)
+        onsets = epochs.events[:, 0].astype(int) - int(self.first_samp)
+        n_raw_samples = self.n_times
 
         # Initialize artifact structures in the epochs
         n_epochs = len(epochs)
@@ -447,28 +457,24 @@ class RawAPICE(mne.io.RawArray):
 
         # Update the artifact structures with information from the raw data
         epochs.artifacts.BCmanual = self.artifacts.BCmanual.copy()
+        bt_raw = np.reshape(self.artifacts.BT, (1, n_raw_samples))
         for ep in np.arange(n_epochs):
-            try:
-                # Convert absolute sample indices to indices relative to RawAPICE by accounting for first_samp
-                epoch_start_time = int(stimulus_times[ep]) - int(self.first_samp) - samples_start
-                epoch_end_time   = epoch_start_time + samples_epoch
+            idx = onsets[ep] + offsets
 
-                # Guard against epochs that clip the edge of the recording.
-                # Such epochs should already have been dropped by mne.Epochs, but
-                # a shape-mismatch (ValueError) would otherwise go uncaught.
-                if epoch_start_time < 0 or epoch_end_time > n_raw_samples:
-                    print(f"Warning: epoch {ep} window [{epoch_start_time}, {epoch_end_time}) "
-                          f"is out of raw bounds [0, {n_raw_samples}). Skipping artifact copy.")
-                    continue
+            # Guard against epochs that clip the edge of the recording.
+            # Such epochs should already have been dropped by mne.Epochs.
+            if idx[0] < 0 or idx[-1] >= n_raw_samples:
+                print(f"Warning: epoch {ep} samples [{idx[0]}, {idx[-1]}] are out of raw bounds "
+                      f"[0, {n_raw_samples}). Skipping artifact copy.")
+                continue
 
-                epochs.artifacts.BCT[ep] = self.artifacts.BCT[:, epoch_start_time:epoch_end_time]
-                epochs.artifacts.CCT[ep] = self.artifacts.CCT[:, epoch_start_time:epoch_end_time]
-                # BC is channel-level (not time-varying within epoch) — copy once per epoch
-                epochs.artifacts.BC[ep]  = self.artifacts.BC
-            except (IndexError, ValueError) as exc:
-                print(f"Warning: Skipping artifact copy for epoch {ep}: {exc}")
+            epochs.artifacts.BCT[ep] = self.artifacts.BCT[:, idx]
+            epochs.artifacts.CCT[ep] = self.artifacts.CCT[:, idx]
+            epochs.artifacts.BT[ep] = bt_raw[:, idx]
+            # BC is channel-level (not time-varying within epoch) — copy once per epoch
+            epochs.artifacts.BC[ep]  = self.artifacts.BC
 
-        return epochs    
+        return epochs
     
 
     def plot_percentage_of_bad_data_across_sensors(self):
@@ -735,7 +741,8 @@ class RawAPICE(mne.io.RawArray):
             if len(idx_reference_channels) > 0:
                 self.artifacts.BC[idx_reference_channels, 0] = False
                 self.artifacts.BCT[idx_reference_channels, :] = False
-                self.artifacts.BCT[idx_reference_channels, self.artifacts.BT[0,:]] = True
+                bt = np.asarray(self.artifacts.BT[0, :], dtype=bool)
+                self.artifacts.BCT[np.ix_(idx_reference_channels, bt)] = True
 
     def add_channels(self, *args, **kwargs):
         _warning_if_change_data_shape()
@@ -1925,28 +1932,30 @@ class EpochsAPICE(mne.EpochsArray):
 
         # get the artifacts in a dataframe
         artifacts_df = self.rejection_matrix_to_data_frame()
-        artifacts_backup = self.artifacts
-        delattr(self, 'artifacts')
-                
-        # Save the epochs and the artifacts information in a csv file in the output directory
-        print('\nExporting epochs...')
+
         full_path = Path(full_path)
         parent_dir = full_path.parent
         file_name = full_path.stem
-        parent_dir.mkdir(parents=True, exist_ok=True)
-        
         epochs_fullpath = parent_dir / (file_name + '.fif')
-        try:
-            self.save(epochs_fullpath, overwrite=overwrite)
-        except Exception:
-            self.artifacts = artifacts_backup
-            raise
-        print(f"Epochs saved at {epochs_fullpath}.")
-        
-        # check if the artifacts .cs file already exists and if overwrite is False, raise an error
         art_fullpath = parent_dir / (file_name + '-artifacts.csv')
+
+        # check before writing anything, so a refused export leaves no half-written output
         if art_fullpath.exists() and not overwrite:
             raise FileExistsError(f"The artifact file {art_fullpath} already exists. Set overwrite=True to overwrite it.")
+
+        # Save the epochs and the artifacts information in a csv file in the output directory
+        print('\nExporting epochs...')
+        parent_dir.mkdir(parents=True, exist_ok=True)
+
+        # the artifacts attribute is removed only while saving, and always restored
+        artifacts_backup = self.artifacts
+        delattr(self, 'artifacts')
+        try:
+            self.save(epochs_fullpath, overwrite=overwrite)
+        finally:
+            self.artifacts = artifacts_backup
+        print(f"Epochs saved at {epochs_fullpath}.")
+
         artifacts_df.to_csv(art_fullpath, index=False)
         print(f"\nEpochs artifacts information saved at {art_fullpath}.")
         
@@ -1967,7 +1976,8 @@ class EpochsAPICE(mne.EpochsArray):
             self.artifacts.BC[:, idx_reference_channels, 0] = False  # Ensure reference channels are not marked as bad channels in BC
             self.artifacts.BCT[:, idx_reference_channels, :] = False  # Ensure reference channels are not marked as bad channels in BCT
             for i in range(self._data.shape[0]):
-                self.artifacts.BCT[i, idx_reference_channels, self.artifacts.BT[i,0,:]] = True
+                bt = np.asarray(self.artifacts.BT[i, 0, :], dtype=bool)
+                self.artifacts.BCT[i][np.ix_(idx_reference_channels, bt)] = True
        
 
     def plot_percentage_of_bad_data_across_sensors(self):
