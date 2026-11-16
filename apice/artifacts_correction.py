@@ -364,6 +364,45 @@ def _target_PCA(data, bad_segment, nSV, vSV, el):
 from joblib import Parallel, delayed
 from multiprocessing import Process, Manager
 
+
+def _channel_geometry(info):
+    """Electrode positions, distances and adjacency in DATA channel order.
+
+    The montage and ``find_ch_adjacency`` only cover channels with positions
+    (EEG), in their own order. Indexing those arrays with data channel
+    indices misaligned them whenever the recording also had other channels
+    (EOG, ECG, stim, ...). Here every array has one row per data channel;
+    channels without a position get NaN positions, infinite distances and
+    no neighbours, so they are never used as spline sources.
+
+    Returns
+    -------
+    positions : numpy.ndarray, shape (n_channels, 3)
+    distance_matrix : numpy.ndarray, shape (n_channels, n_channels)
+    adjacency_matrix : numpy.ndarray of bool, shape (n_channels, n_channels)
+    """
+    from scipy.spatial.distance import cdist
+
+    ch_names = list(info['ch_names'])
+    n_ch = len(ch_names)
+    ch_pos = info.get_montage().get_positions()['ch_pos']
+    origin = _check_origin("auto", info)
+    positions = np.full((n_ch, 3), np.nan)
+    for i, ch in enumerate(ch_names):
+        if ch in ch_pos and np.all(np.isfinite(ch_pos[ch])):
+            positions[i] = np.asarray(ch_pos[ch]) - origin
+    has_pos = np.all(np.isfinite(positions), axis=1)
+
+    distance_matrix = np.full((n_ch, n_ch), np.inf)
+    distance_matrix[np.ix_(has_pos, has_pos)] = cdist(positions[has_pos], positions[has_pos])
+
+    adjacency_matrix = np.zeros((n_ch, n_ch), dtype=bool)
+    adj, adj_names = mne.channels.find_ch_adjacency(info, 'eeg')
+    idx = np.array([ch_names.index(ch) for ch in adj_names], dtype=int)
+    adjacency_matrix[np.ix_(idx, idx)] = adj.toarray().astype(bool)
+
+    return positions, distance_matrix, adjacency_matrix
+
 def _process_bad_channel(bad_idx, ch_names, ch_names_montage, positions, bad_channel_indices, new_exclude_index, data, distances_matrix):
     """Interpolate one bad channel using spherical spline neighbors.
 
@@ -395,8 +434,11 @@ def _process_bad_channel(bad_idx, ch_names, ch_names_montage, positions, bad_cha
     
     #Processes a single bad channel and performs spherical spline interpolation.    
     bad_ch_name = ch_names[bad_idx]
-    bad_pos = positions[ch_names_montage.index(ch_names[bad_idx])]
-    bad_pos = np.reshape(bad_pos, (1, 3))
+    # positions are in data channel order (see _channel_geometry)
+    bad_pos = np.reshape(positions[bad_idx], (1, 3))
+    if not np.all(np.isfinite(bad_pos)):
+        print(f"Spherical Spline interpolation skipped for channel {bad_ch_name}: no electrode position")
+        return bad_idx, None
 
     distances = distances_matrix[bad_idx,:].copy()
     distances[bad_channel_indices] = np.inf
@@ -519,27 +561,35 @@ def _do_spherical_spline_interpolation(raw, distances_matrix, positions, adjacen
     for electrode in exclude:
         exclude_indices.append(raw.ch_names.index(electrode)) 
     
-    # Determine which channels doesn't have sufficient good neighbors    
-    new_exclude = []
-    for el in exclude_indices:
-        # Find the number of bad neighbors per electrode
-        el_neighbors = list(np.where(adjacency_matrix[el])[0])
-        el_neighbors.remove(el)
-        # Determine the bad channel neighbors
-        bad_el_neighbors = [i for i in exclude_indices if i in el_neighbors]
-        # Get the ratio of bad neighbors
-        bad_neighbors_proportion = len(bad_el_neighbors) / len(el_neighbors)
-        # If the ratio is greater than bad_neighbor_proportion, remove the electrode from exclude list
-        if bad_neighbors_proportion <= bad_neighbor_proportion:
-            new_exclude.append(raw.ch_names[el])
-    
-    new_exclude_index = [ch_names.index(ch) for ch in new_exclude]
-    
     # Removing the all bad channels
     if not interpolation_channels:
         bad_channel_indices = list(set(bad_channel_indices).symmetric_difference(set(exclude_indices)))
         exclude_channels[bad_channel_indices] = True
-    
+
+    # No bad channel is ever used as a spline source: neither the excluded
+    # ones nor those to interpolate (including any dropped just below).
+    # Previously, with bad_neighbor_proportion < 1, a bad channel surrounded
+    # by bad channels was wrongly kept as a source.
+    all_bad_set = set(exclude_indices) | set(bad_channel_indices)
+    new_exclude_index = sorted(all_bad_set)
+
+    # Do not interpolate channels with too many bad neighbours (as in the
+    # MATLAB eega_InterpSphericSpline 'pneigh'): the proportion of bad
+    # neighbours is computed for each channel to interpolate, counting as bad
+    # every bad channel (excluded ones and ones being interpolated).
+    if bad_neighbor_proportion is not None and bad_neighbor_proportion < 1:
+        keep = []
+        for el in bad_channel_indices:
+            el_neighbors = [i for i in np.where(adjacency_matrix[el])[0] if i != el]
+            if len(el_neighbors) == 0:
+                continue  # no neighbours: cannot be interpolated reliably
+            p_bad = sum(i in all_bad_set for i in el_neighbors) / len(el_neighbors)
+            if p_bad <= bad_neighbor_proportion:
+                keep.append(el)
+            else:
+                print(f"Channel {ch_names[el]} not interpolated: {p_bad:.0%} of its neighbours are bad")
+        bad_channel_indices = keep
+
 
     # Interpolate bad channels in the EEG data
     new_interpolated_data = _parallel_interpolate(bad_channel_indices, ch_names, ch_names_montage, positions, new_exclude_index, data, distances_matrix, n_jobs=n_jobs)
@@ -1215,15 +1265,9 @@ class ChannelsSphericalSplineInterpolation(ArtCorrection):
         good_channels = np.reshape(raw.artifacts.BC,(n_epochs, n_electrodes, 1), order='F')==False
         if np.size(raw._data) > 0:
 
-            # Get adjacency matrix
+            # Positions, distances and adjacency in data channel order (computed once)
             print('\nExtracting electrode adjacency matrix.')
-            adjacency_matrix = mne.channels.find_ch_adjacency(raw.info, 'eeg')[0].toarray()
-            
-            # Computing the distances only once
-            from scipy.spatial.distance import cdist
-            spec_ch_pos = raw.info.get_montage().get_positions()['ch_pos']
-            positions = np.array(list(spec_ch_pos.values())) - _check_origin("auto", raw.info)
-            distance_matrix = cdist(positions, positions, metric='euclidean')
+            positions, distance_matrix, adjacency_matrix = _channel_geometry(raw.info)
 
             # Initialize the interpolation matrix to False
             interpolation_matrix = np.full((n_epochs, n_electrodes, n_samples), False)
@@ -1402,15 +1446,9 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
         print('\nDefining data to interpolate...')
         bct_to_interpolate = _build_interpolation_matrix_spline(raw, self.params['min_good_time'], self.params['min_intertime'], self.params['mask_time'], self.params['min_segment_time'])
 
-        # Computing the distances only once
-        from scipy.spatial.distance import cdist
-        spec_ch_pos = raw.info.get_montage().get_positions()['ch_pos']
-        positions = np.array(list(spec_ch_pos.values())) - _check_origin("auto", raw.info)
-        distance_matrix = cdist(positions, positions, metric='euclidean')
-
-        # Get adjacency matrix
+        # Positions, distances and adjacency in data channel order (computed once)
         print('\nExtracting electrode adjacency matrix.')
-        adjacency_matrix = mne.channels.find_ch_adjacency(raw.info, 'eeg')[0].toarray()
+        positions, distance_matrix, adjacency_matrix = _channel_geometry(raw.info)
 
 
         badIntervals = []
