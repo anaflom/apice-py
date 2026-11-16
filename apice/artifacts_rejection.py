@@ -46,7 +46,9 @@ class ArtifactsConfiguration:
         max_loops : int, default=2
             Maximum loops allowed for this group.
         min_rejection : float, default=0
-            Minimum new-rejection percentage required to continue looping.
+            Minimum percentage (not fraction) of newly rejected data required
+            to continue looping; e.g. 0.00023 means 0.00023 %. The detections
+            of the loop that falls below it are kept, and the loop stops.
         position : int | None, default=None
             Group execution order. If ``None``, appends at the end.
         define_bcbt : bool, default=True
@@ -458,19 +460,21 @@ def run_algorithms(raw, cfg: str | Path | dict = None, force_cfg=False, l_freq=N
                 # add a row to the summary table for this algorithm and loop
                 summary_table.add_row(group_name, algorithm_name, loop_counter, False, f"{perc_detected:.2f}%", f"{perc_new_detected:.2f}%", f"{perc_total_detected:.2f}%")
             
+            # newly rejected data in PERCENT (same units as min_rejection, see
+            # standard_conf.min_rejection_from_thresh)
             new_rej = np.sum(np.logical_and(bct_new, np.logical_not(raw.artifacts.BCT)))/np.size(bct_new)*100
-            print(f" > Total newly rejected data after loop {loop_counter}: {new_rej:.2f}%")
+            print(f" > Total newly rejected data after loop {loop_counter}: {new_rej:.6f}%")
 
-            # if the new rejection is below the minimum rejection threshold and we have reached the minimum number of loops, we can stop the loop
+            # Update the BCT with the new detected artifacts. The detections of
+            # the loop that triggers the stop are kept too: they used to be
+            # discarded, which with min_loops=0 could drop real artifacts found
+            # in the first loop.
+            raw.artifacts.BCT = np.logical_or(raw.artifacts.BCT, bct_new)
+
+            # if the new rejection is below the minimum rejection threshold and we have reached the minimum number of loops, stop iterating
             if new_rej < min_rejection and loop_counter > min_loops:
                 print(f"Stopping the loop as the new rejection is below the minimum threshold of {min_rejection}% and we have reached the minimum number of loops of {min_loops}.")
-                print(f"Rejection for group '{group_name}' and loop {loop_counter} will not be considered neither added to the summary table.")
-                # remove the rows in the summary table corresponsig to the algorithms applied in this loop
-                summary_table.remove_rows(group_name, loop_counter, post_detection=False)
                 break
-
-            # Update the BCT with the new detected artifacts
-            raw.artifacts.BCT = np.logical_or(raw.artifacts.BCT, bct_new)
         
         print("\nRunning post-detection algorithms...")
         print("-"*30)
