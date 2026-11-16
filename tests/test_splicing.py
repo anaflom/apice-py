@@ -120,7 +120,7 @@ def _splice(y, segs, method, n=None, **kw):
     kw.setdefault("window", SF)
     kw.setdefault("guard", 5)
     kw.setdefault("step_window", 4 * SF)
-    kw.setdefault("step_min", SF // 20)
+    kw.setdefault("step_min", SF)
     kw.setdefault("null_step", SF // 10)
     return np.squeeze(_splice_segments(y, np.array(segs), np.array([0, n]), method=method, **kw))
 
@@ -268,9 +268,9 @@ def test_adaptive_reports_its_decisions():
 
 def _undecidable_step_case():
     """A step with too little clean data before it to estimate the level
-    (the segment starts 8 samples into the epoch; shortest window 12)."""
+    (the segment starts 0.5 s into the epoch; shortest window 1 s)."""
     x, y, _, _ = _step_case(seed=10)
-    I, F = 8, 8 + 25
+    I, F = SF // 2, SF // 2 + 25
     y = x.copy()
     y[I:F] += 50e-6
     y[F:] += 200e-6
@@ -330,10 +330,10 @@ def test_level_windows_do_not_cross_other_artifacts():
     np.testing.assert_array_equal(ad[before], y[before])
 
 
-def test_matched_reference_decides_with_many_short_marks():
-    """Many short per-channel bad marks (as in infant data) leave little
-    contiguous clean data; the matched reference still decides, with short
-    windows, and finds a large step."""
+def test_many_short_marks_fall_back_and_remove_the_step():
+    """Many short per-channel bad marks (as in infant data) leave less than
+    1 s of contiguous clean data around most runs: they are undecidable and
+    spliced as method 1, which still removes a (spline-corrected) step."""
     x, y, I, F = _step_case(seed=13, jump=200e-6)
     rng = np.random.default_rng(0)
     bct = np.zeros(y.size, bool)
@@ -344,7 +344,7 @@ def test_matched_reference_decides_with_many_short_marks():
             bct[t:t + int(rng.uniform(0.02, 0.2) * SF)] = True
     st = {}
     ad = _splice(y, [[I, F]], "adaptive", bct=bct, stats=st)
-    assert st["undecidable"] < 0.2 * sum(st.values())
+    assert st["undecidable"] > 0.5 * sum(st.values())
     after = slice(F + 30, None)
     good = ~bct[after]
     assert _rms((ad[after] - x[after])[good]) < 40e-6      # the 200 uV step is removed

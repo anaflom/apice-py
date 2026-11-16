@@ -59,7 +59,7 @@ SPLICE_METHODS = (1, 'trend', 'adaptive')
 
 def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=1,
                      corrected=None, window=250, guard=5, order=1, align_bad_times=True,
-                     step_window=1000, step_min=12, step_k=2.5, null_step=25,
+                     step_window=1000, step_min=250, step_k=2.5, null_step=25,
                      anchor='sample', anchor_window=25, undecidable='method1', stats=None):
     """Splice corrected segments to reduce discontinuities at segment borders.
 
@@ -128,9 +128,11 @@ def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=
         before and after a run (callers pass ~4 s); halved until it fits in
         the contiguous good data on both sides and enough reference spans
         exist.
-    step_min : int, default=12
-        ``'adaptive'``: shortest window allowed (callers pass ~50 ms);
-        shorter clean data -> 'undecidable'.
+    step_min : int, default=250
+        ``'adaptive'``: shortest window allowed (callers pass 1 s; shorter
+        windows had too little power with large infant slow waves, so a
+        missed step was declared 'no_step'); shorter clean data ->
+        'undecidable'.
     undecidable : {'method1', 'edges'}, default='method1'
         ``'adaptive'``, when there is not enough good data to decide:
         'method1' splices that run as method 1 (offset to the data before;
@@ -411,7 +413,7 @@ SPLICE_STEP_DECISIONS = ('step', 'no_step', 'undecidable')
 
 def _splice_segments_adaptive(data, bad_if, epoch_if, bct=None, bt=None, bc=None, corrected=None,
                               window=250, guard=5, order=1, align_bad_times=True,
-                              step_window=1000, step_min=12, step_k=2.5, null_step=25,
+                              step_window=1000, step_min=250, step_k=2.5, null_step=25,
                               anchor='sample', anchor_window=25, undecidable='method1',
                               stats=None, min_side=3, min_null=20):
     """Step-aware splicing (see ``_splice_segments``, method ``'adaptive'``).
@@ -430,7 +432,9 @@ def _splice_segments_adaptive(data, bad_if, epoch_if, bct=None, bt=None, bc=None
        ``min_null`` positions exist, w is halved again. Long clean stretches
        thus give sensitive, low-noise windows, while short ones (e.g. many
        short bad marks) still allow a decision with short windows and a
-       reference that is noisier in the same way.
+       reference that is noisier in the same way. Windows shorter than
+       ``step_min`` (callers: 1 s) are not used: with large slow waves they
+       cannot detect relevant steps, so such runs are 'undecidable'.
        |difference| > ``step_k`` robust SDs: 'step', and all the data after
        the run, up to the end of the epoch, are shifted by -difference.
        Otherwise 'no_step'. If the levels or the null cannot be computed:
@@ -1676,7 +1680,7 @@ class TargetPCA(ArtCorrection):
                                              window=int(round(1.0 * raw.info['sfreq'])),
                                              guard=int(round(0.02 * raw.info['sfreq'])),
                                              step_window=int(round(4.0 * raw.info['sfreq'])),
-                                             step_min=int(round(0.05 * raw.info['sfreq'])),
+                                             step_min=int(round(1.0 * raw.info['sfreq'])),
                                              step_k=splice_step_k,
                                              null_step=int(round(0.1 * raw.info['sfreq'])),
                                              anchor_window=int(round(0.1 * raw.info['sfreq'])),
@@ -2168,7 +2172,7 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
                                             window=int(round(1.0 * sfreq)),
                                             guard=int(round(0.02 * sfreq)),
                                             step_window=int(round(4.0 * sfreq)),
-                                            step_min=int(round(0.05 * sfreq)),
+                                            step_min=int(round(1.0 * sfreq)),
                                             step_k=self.params.get('splice_step_k', 2.5),
                                             null_step=int(round(0.1 * sfreq)),
                                             anchor_window=int(round(0.1 * sfreq)),
