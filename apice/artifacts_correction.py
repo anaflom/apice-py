@@ -189,7 +189,9 @@ def _splice_segments1(data, bad_if, epoch_if, bct=None, bt=None, bc=None):
             
             sample_I = I_all[(I_all >= Epoch_I[iep]) & (I_all <= Epoch_F[iep])]
             sample_F = F_all[(F_all >= Epoch_I[iep]) & (F_all <= Epoch_F[iep])]
-            the_I = np.unique(np.hstack([Epoch_I, sample_I, sample_F, Epoch_F]))
+            # boundaries of THIS epoch only (as in the MATLAB eega_splicesgments1);
+            # using all epochs' limits aligned each epoch to the end of the previous one
+            the_I = np.unique(np.hstack([Epoch_I[iep], sample_I, sample_F, Epoch_F[iep]]))
             the_I = np.asarray(the_I, dtype=int)
     
             if np.size(the_I) > 2:
@@ -718,23 +720,18 @@ def _modify_rej(rej, segment_samples, max_samples):
     # initialize new rejection matrix
     rej_out = np.full(np.shape(rej), 0, dtype=int)
     
-    # define segments
-    seg = np.arange(0, n_samples-segment_samples, segment_samples)
-    
+    # define segments (the last one may be shorter). Same segments as before,
+    # but also valid when the data are shorter than one segment.
+    segment_samples = max(1, int(segment_samples))
+    seg = np.arange(0, n_samples, segment_samples)
+
     # iterate over segments
     for segi in seg:
         m = rej[:,segi:segi+segment_samples]
         nreji = np.sum(m,axis=1)
         idx_ch_rej = nreji>max_samples
         rej_out[idx_ch_rej, segi:segi+segment_samples] = 1
-        
-    # last segment
-    segi = seg[-1]+segment_samples
-    m = rej[:,segi:]
-    nreji = np.sum(m,axis=1)
-    idx_ch_rej = nreji>max_samples
-    rej_out[idx_ch_rej, segi:] = 1
-    
+
     return rej_out
 
 def _find_segments_interpolation_spline(rej, bad_channels):
@@ -1581,15 +1578,17 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
             if np.size(bad_if)>0:
                 d_i = np.squeeze(interpolatedData[ep,:,:])
                 epoch_if = np.asarray([0, n_samples])
+                # copies: np.squeeze and basic indexing return views, so the
+                # line below used to clear raw.artifacts.BCT itself
                 if len(np.shape(raw._data))==2:
-                    bct_i = np.squeeze(raw.artifacts.BCT)
-                    bc_i = raw.artifacts.BC
-                    bt_i = raw.artifacts.BT           
+                    bct_i = np.squeeze(raw.artifacts.BCT).copy()
+                    bc_i = raw.artifacts.BC.copy()
+                    bt_i = raw.artifacts.BT.copy()
                 else:
-                    bct_i = np.squeeze(raw.artifacts.BCT[ep,:,:])
-                    bc_i = np.squeeze(raw.artifacts.BC[ep,:,0])
-                    bt_i = np.squeeze(raw.artifacts.BT[ep,0,:])
-                bct_i[int_i] = 0  
+                    bct_i = np.squeeze(raw.artifacts.BCT[ep,:,:]).copy()
+                    bc_i = np.squeeze(raw.artifacts.BC[ep,:,0]).copy()
+                    bt_i = np.squeeze(raw.artifacts.BT[ep,0,:]).copy()
+                bct_i[int_i] = 0
                 dspliced = _splice_segments(d_i, bad_if, epoch_if, bct=bct_i, bt=bt_i, bc=bc_i, method=1)
                 interpolatedData[ep,:,:] = dspliced
            
