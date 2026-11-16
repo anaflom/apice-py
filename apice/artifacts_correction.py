@@ -59,7 +59,8 @@ SPLICE_METHODS = (1, 'trend', 'adaptive')
 
 def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=1,
                      corrected=None, window=250, guard=5, order=1, align_bad_times=True,
-                     step_window=500, step_k=3.0, null_step=25):
+                     step_window=1000, step_k=3.0, null_step=25, anchor='sample',
+                     anchor_window=25):
     """Splice corrected segments to reduce discontinuities at segment borders.
 
     Parameters
@@ -92,14 +93,18 @@ def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=
           (``window`` samples per side, skipping ``guard`` samples next to
           the segment, within the epoch, excluding bad and corrected
           samples). Good data are never modified, so a step artifact is left
-          in the data after it. See ``_splice_segments_trend``.
-        - ``'adaptive'``: decides for each corrected segment (and bad-time
-          run) whether it is a step, by comparing the level of the good data
-          before and after it (``step_window`` samples per side) with the
-          variability of such before/after differences at random positions
-          of GOOD data in the same channel. Steps: the data after the segment
-          are shifted to the level before it (as method 1, but with robust
-          levels, not single samples). Otherwise, as ``'trend'``. See
+          in the data after it. NOT recommended for infant data: with large
+          slow waves, replacing the segment's trend removes real activity
+          inside it (splicing study 2026-11). See ``_splice_segments_trend``.
+        - ``'adaptive'``: decides for each non-good run (corrected, bad or
+          bad time) whether it is a step, by comparing the level of the good
+          data before and after it (``step_window`` samples per side) with
+          the variability of such before/after differences at positions of
+          GOOD data in the same channel. Steps: the data after the run are
+          shifted to the level before it (as method 1, but with robust
+          levels, not single samples). Then the corrected samples are aligned
+          at their edges, keeping their own shape (as MATLAB method 3; see
+          ``anchor``). Good data are modified only after detected steps. See
           ``_splice_segments_adaptive``.
         - ``None`` / ``0``: no splicing.
     corrected : numpy.ndarray | None, default=None
@@ -115,9 +120,18 @@ def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=
         With ``'trend'`` / ``'adaptive'``, also align bad-time runs to the
         surrounding good data (they stay marked as bad; this only reduces how
         much a later high-pass spreads their offset into good data).
-    step_window : int, default=500
+    step_window : int, default=1000
         ``'adaptive'``: samples per side used to estimate the level before
-        and after a segment (callers pass ~2 s).
+        and after a segment (callers pass ~4 s).
+    anchor : {'sample', 'linear'}, default='sample'
+        ``'adaptive'``: edge anchors of the corrected segments. 'sample':
+        the neighbouring samples (exact continuity; best when edges are clean,
+        which the masking of bad segments usually ensures). 'linear': lines
+        fitted to ``anchor_window`` samples on each side of the edge
+        (skipping ``guard`` outside), extrapolated to it (robust to missed
+        artifact edges, less exact otherwise).
+    anchor_window : int, default=25
+        ``'adaptive'`` with anchor='linear' (callers pass ~100 ms).
     step_k : float, default=3.0
         ``'adaptive'``: a segment is a step if the before/after level
         difference exceeds ``step_k`` robust SDs of the null distribution.
@@ -144,7 +158,8 @@ def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=
                                        corrected=corrected, window=window, guard=guard,
                                        order=order, align_bad_times=align_bad_times,
                                        step_window=step_window, step_k=step_k,
-                                       null_step=null_step)
+                                       null_step=null_step, anchor=anchor,
+                                       anchor_window=anchor_window)
     else:
         raise ValueError(f"splice method must be one of {SPLICE_METHODS} or None, got {method!r}")
     return dN
@@ -248,6 +263,64 @@ def _trend_replace_run(out, src, ok, i0, f0, ei, ef, window, guard, order, min_s
     return True
 
 
+def _edge_level(src, ok, idx, t0):
+    """Value at t0 of a straight line fitted to src[idx] (good samples only);
+    a constant if fewer than 6 samples; None if fewer than 1."""
+    idx = idx[ok[idx]] if ok is not None else idx
+    if idx.size == 0:
+        return None
+    if idx.size < 6:
+        return float(np.mean(src[idx]))
+    p = np.polyfit(idx - t0, src[idx], 1)
+    return float(p[1])
+
+
+def _edge_align_run(out, src, ok, i0, f0, ei, ef, anchor='sample', anchor_window=25, guard=5):
+    """Segment-only alignment at the edges (MATLAB eega_splicesgments3 style).
+
+    The run src[i0:f0] keeps its own shape; it is offset so that its start
+    meets the good data before it, and a linear ramp makes its end meet the
+    good data after it (a constant offset if only one side is available).
+    Writes into ``out``.
+
+    anchor='sample': the neighbouring samples src[i0-1] and src[f0] (exact
+        continuity; best when the bad segment edges are clean, e.g. thanks
+        to the masking of bad segments).
+    anchor='linear': lines fitted to ``anchor_window`` good samples outside
+        (skipping ``guard``) and to the first/last ``anchor_window`` samples
+        of the run, extrapolated to the edge (more robust when the edges of
+        the artifact were missed, less exact otherwise).
+    """
+    n = f0 - i0
+    dL = dR = None
+    if anchor == 'sample':
+        if i0 - 1 >= ei and ok[i0 - 1]:
+            dL = src[i0 - 1] - src[i0]
+        if f0 < ef and ok[f0]:
+            dR = src[f0] - src[f0 - 1]
+    elif anchor == 'linear':
+        w = max(int(anchor_window), 1)
+        wi = min(w, n)
+        lo = _edge_level(src, ok, np.arange(max(ei, i0 - guard - w), max(ei, i0 - guard)), i0 - 0.5)
+        if lo is not None:
+            li = _edge_level(src, None, np.arange(i0, i0 + wi), i0 - 0.5)
+            dL = lo - li
+        ro = _edge_level(src, ok, np.arange(min(ef, f0 + guard), min(ef, f0 + guard + w)), f0 - 0.5)
+        if ro is not None:
+            ri = _edge_level(src, None, np.arange(f0 - wi, f0), f0 - 0.5)
+            dR = ro - ri
+    else:
+        raise ValueError(f"anchor must be 'sample' or 'linear', got {anchor!r}")
+    if dL is None and dR is None:
+        return False
+    if dL is not None and dR is not None:
+        corr = dL + (dR - dL) * (np.arange(n) / max(n - 1, 1))
+    else:
+        corr = np.full(n, dL if dL is not None else dR)
+    out[i0:f0] = src[i0:f0] + corr
+    return True
+
+
 def _good_window_sums(x, ok):
     """Cumulative sums to get, in O(1), the sum and count of good samples of
     any window [a, b): sum = cs_x[b] - cs_x[a], count = cs_n[b] - cs_n[a]."""
@@ -281,7 +354,8 @@ def _step_null_sd(cs_x, cs_n, starts, ends, gap, window, guard, null_step, min_n
 
 def _splice_segments_adaptive(data, bad_if, epoch_if, bct=None, bt=None, bc=None, corrected=None,
                               window=250, guard=5, order=1, align_bad_times=True,
-                              step_window=500, step_k=3.0, null_step=25, min_side=3):
+                              step_window=1000, step_k=3.0, null_step=25, min_side=3,
+                              anchor='sample', anchor_window=25):
     """Step-aware splicing (see ``_splice_segments``, method ``'adaptive'``).
 
     Per channel, every run of non-good samples (corrected, bad or bad time),
@@ -297,8 +371,10 @@ def _splice_segments_adaptive(data, bad_if, epoch_if, bct=None, bt=None, bc=None
        ``step_k`` robust SDs, the run is a step and all the data after it, up
        to the end of the epoch, are shifted by -difference.
     2. Corrected samples in the run (and bad-time samples, if
-       ``align_bad_times``) get the trend replacement of ``'trend'``,
-       computed on the (possibly shifted) data.
+       ``align_bad_times``) are aligned at their edges and keep their own
+       shape (``_edge_align_run``: offset at the start, linear ramp to the
+       end; ``anchor`` 'sample' or 'linear'), on the (possibly shifted) data.
+       ``window`` and ``order`` are not used (kept for a common signature).
 
     Bad samples that are neither corrected nor bad time are left as they are
     (they are still shifted with the rest of the data after a step).
@@ -359,15 +435,17 @@ def _splice_segments_adaptive(data, bad_if, epoch_if, bct=None, bt=None, bc=None
                         # after a non-good run never changes them: keep the cache
                         cs_x, cs_n = _good_window_sums(x, ok)
 
-                # 2. trend replacement of the corrected (and bad-time) samples
-                # (fits only read good samples and the run itself, and are
-                # computed before writing, so x can be both source and output)
+                # 2. edge alignment of the corrected (and bad-time) samples:
+                # they keep their own shape (replacing their trend, as in
+                # 'trend', removed real slow activity with large infant delta).
+                # Anchors only read good samples and the run itself, and are
+                # computed before writing, so x can be both source and output.
                 targets = corrected[ch, i0:f0].copy()
                 if align_bad_times:
                     targets |= bt[i0:f0] & ~corrected[ch, i0:f0]
                 for a, b in _true_runs(targets):
-                    _trend_replace_run(x, x, ok, i0 + a, i0 + b, ei, ef,
-                                       window, guard, order, min_side)
+                    _edge_align_run(x, x, ok, i0 + a, i0 + b, ei, ef,
+                                    anchor=anchor, anchor_window=anchor_window, guard=guard)
 
     return dN
 
@@ -1462,8 +1540,9 @@ class TargetPCA(ArtCorrection):
                         d = _splice_segments(d, bad_if, epoch_if, bct=BCT[el, :], method=splice_method,
                                              window=int(round(1.0 * raw.info['sfreq'])),
                                              guard=int(round(0.02 * raw.info['sfreq'])),
-                                             step_window=int(round(2.0 * raw.info['sfreq'])),
-                                             null_step=int(round(0.1 * raw.info['sfreq'])))
+                                             step_window=int(round(4.0 * raw.info['sfreq'])),
+                                             null_step=int(round(0.1 * raw.info['sfreq'])),
+                                             anchor_window=int(round(0.1 * raw.info['sfreq'])))
     
                     # Store the data
                     data_pca[el, :] = d
@@ -1941,8 +2020,9 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
                                             corrected=int_i,
                                             window=int(round(1.0 * sfreq)),
                                             guard=int(round(0.02 * sfreq)),
-                                            step_window=int(round(2.0 * sfreq)),
-                                            null_step=int(round(0.1 * sfreq)))
+                                            step_window=int(round(4.0 * sfreq)),
+                                            null_step=int(round(0.1 * sfreq)),
+                                            anchor_window=int(round(0.1 * sfreq)))
                 interpolatedData[ep,:,:] = dspliced
            
         # reshape if necessary         

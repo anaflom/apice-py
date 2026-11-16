@@ -119,7 +119,7 @@ def _splice(y, segs, method, n=None, **kw):
     n = y.size if n is None else n
     kw.setdefault("window", SF)
     kw.setdefault("guard", 5)
-    kw.setdefault("step_window", 2 * SF)
+    kw.setdefault("step_window", 4 * SF)
     kw.setdefault("null_step", SF // 10)
     return np.squeeze(_splice_segments(y, np.array(segs), np.array([0, n]), method=method, **kw))
 
@@ -182,13 +182,60 @@ def test_adaptive_step_robust_to_missed_jump_end():
 
 
 def test_adaptive_transient_artifact_leaves_good_data_untouched():
-    """Not a step: behaves as 'trend' (segment-only)."""
+    """Not a step: only the segment changes; it keeps its own shape and is
+    aligned at its edges (single-sample anchors by default)."""
     x = _clean(seed=5)
     I, F = 2000, 2250
     y = _corrupt(x, I, F)
     ad = _splice(y, [[I, F]], "adaptive")
+    good = np.ones(y.size, bool)
+    good[I:F] = False
+    np.testing.assert_array_equal(ad[good], y[good])
+    np.testing.assert_allclose([ad[I], ad[F - 1]], [y[I - 1], y[F]], rtol=0, atol=1e-15)
+    corr = ad[I:F] - y[I:F]                         # offset + linear ramp only
+    np.testing.assert_allclose(np.diff(corr, 2), 0, atol=1e-18)
+
+
+def _infant_background(n=SF * 20, seed=0):
+    """Large delta (0.5-2 Hz, ~70 uV RMS) on top of the default background."""
+    rng = np.random.default_rng(seed + 100)
+    t = np.arange(n) / SF
+    delta = sum(rng.uniform(20e-6, 60e-6) * np.sin(2 * np.pi * f * t + rng.uniform(0, 6.3))
+                for f in rng.uniform(0.5, 2.0, 4))
+    return _clean(n, seed) + delta
+
+
+def test_adaptive_keeps_slow_waves_inside_segments():
+    """The splicing study found that replacing the segment trend ('trend')
+    removes real delta inside segments; edge alignment keeps it."""
+    x = _infant_background(seed=7)
+    I, F = 2000, 2250                               # 1 s segment
+    y = _corrupt(x, I, F)
+    ad = _splice(y, [[I, F]], "adaptive")
     tr = _splice(y, [[I, F]], "trend")
-    np.testing.assert_array_equal(ad, tr)
+    err_ad = _rms(ad[I:F] - x[I:F])
+    err_tr = _rms(tr[I:F] - x[I:F])
+    assert err_ad < 0.5 * err_tr
+
+
+@pytest.mark.parametrize("anchor", ["sample", "linear"])
+def test_adaptive_anchor_options(anchor):
+    x = _clean(seed=8)
+    I, F = 2000, 2250
+    y = _corrupt(x, I, F)
+    ad = _splice(y, [[I, F]], "adaptive", anchor=anchor, anchor_window=SF // 10)
+    assert _rms(ad[I:F] - x[I:F]) < 0.5 * _rms(y[I:F] - x[I:F])
+
+
+def test_adaptive_linear_anchor_robust_to_missed_edges():
+    x = _clean(seed=9)
+    I, F = 2000, 2250
+    y = _corrupt(x, I, F)
+    y[I - 8:I] += 150e-6                            # unmarked artifact edges
+    y[F:F + 8] += 150e-6
+    sample = _splice(y, [[I, F]], "adaptive", anchor="sample")
+    linear = _splice(y, [[I, F]], "adaptive", anchor="linear", anchor_window=SF // 10)
+    assert _rms(linear[I:F] - x[I:F]) < _rms(sample[I:F] - x[I:F])
 
 
 def test_adaptive_null_uses_only_good_data():
