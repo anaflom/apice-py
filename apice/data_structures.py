@@ -652,7 +652,7 @@ class RawAPICE(mne.io.RawArray):
         -------
         None
         """
-        cfg_artifacts_detection = get_cfg(cfg, 'detect_artifacts_all_config.json')
+        cfg_artifacts_detection = get_cfg(cfg, 'detect_artifacts_motion_config.json')  # the pipeline default; 'detect_artifacts_all_config.json' did not exist
         self.run_algorithms(cfg_artifacts_detection, l_freq=l_freq, h_freq=h_freq)
         
     def correct_target_pca(self, cfg=None):
@@ -1321,7 +1321,7 @@ class EpochsAPICE(mne.EpochsArray):
         -------
         None
         """
-        cfg_artifacts_detection = get_cfg(cfg, 'detect_artifacts_all_config.json')
+        cfg_artifacts_detection = get_cfg(cfg, 'detect_artifacts_motion_config.json')  # the pipeline default; 'detect_artifacts_all_config.json' did not exist
         self.run_algorithms(cfg_artifacts_detection)
         
     def correct_target_pca(self, cfg=None):

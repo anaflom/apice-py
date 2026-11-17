@@ -1679,11 +1679,11 @@ def reject_relative_per_cha(data, art, thresh, iq_half=False, remove_bt=True, re
         else:
             perc = np.nanpercentile(d, [25, 75], method='hazen')
             IQ = perc[1] - perc[0]
-            if thresh[0]:
+            if thresh[0] is not None:   # 0 is a real threshold
                 t_l = perc[0] + thresh[0] * IQ   
             else:
                 t_l = -np.inf   
-            if thresh[1]:
+            if thresh[1] is not None:   # 0 is a real threshold
                 t_u = perc[1] + thresh[1] * IQ
             else:
                 t_u = np.inf   
@@ -1785,11 +1785,11 @@ def reject_relative(data, art, thresh, iq_half=False, remove_bt=True, remove_bct
     else:
         perc = np.nanpercentile(data_rej.flatten(), [25,75], method='hazen')
         IQ = perc[1] - perc[0]
-        if thresh[0]:
+        if thresh[0] is not None:   # 0 is a real threshold
             t_l = perc[0] + thresh[0] * IQ   
         else:
             t_l = -np.inf   
-        if thresh[1]:
+        if thresh[1] is not None:   # 0 is a real threshold
             t_u = perc[1] + thresh[1] * IQ
         else:
             t_u = np.inf  
@@ -1832,9 +1832,10 @@ def reject_absolute(data, thresh, iq_half=False):
     if iq_half:
         if _is_number(thresh):
             thresh= [thresh]
+        thresh = list(thresh)
         if len(thresh)>1:
             raise Exception("a unique threshold is required when using iq_half=True")
-        if not thresh[0]:
+        if thresh[0] is None:   # 0 is a real threshold
             thresh[0] = np.inf
     else:
         if _is_number(thresh):
@@ -1850,11 +1851,11 @@ def reject_absolute(data, thresh, iq_half=False):
         t_u = thresh[0]
         t_l = -t_u
     else:
-        if thresh[0]:
+        if thresh[0] is not None:   # 0 is a real threshold
             t_l = thresh[0]
         else:
             t_l = -np.inf
-        if thresh[1]:
+        if thresh[1] is not None:   # 0 is a real threshold
             t_u = thresh[1]
         else:
             t_u = np.inf

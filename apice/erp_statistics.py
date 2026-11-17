@@ -3,6 +3,11 @@
 import numpy as np
 from mne import BaseEpochs
 
+try:  # same channel resolution as Epochs.get_data()
+    from mne._fiff.pick import _picks_to_idx
+except ImportError:  # older MNE
+    from mne.io.pick import _picks_to_idx
+
 
 def compute_sme(
     epochs,
@@ -15,6 +20,7 @@ def compute_sme(
     n_samples=None,
     relative=False,
     random_state=None,
+    return_ch_names=False,
 ):
     """Compute the Standardized Measurement Error (SME) via bootstrapping.
 
@@ -52,8 +58,11 @@ def compute_sme(
         of the epoch.
     picks : str | list | slice | None
         Channel selection passed to ``epochs.get_data()``. Used only when
-        ``roi`` is ``None``. If ``None``, defaults to all EEG channels.
-        Ignored when ``roi`` is set.
+        ``roi`` is ``None``. If ``None``, all EEG channels (``'eeg'``; MNE's
+        own default would also take EOG / ECG channels). Ignored when ``roi``
+        is set. As in MNE, a channel TYPE (e.g. ``'eeg'``) excludes the
+        channels in ``info['bads']``, while channel NAMES do not; use
+        ``return_ch_names=True`` to know which channels the values belong to.
     roi : list of str | None
         Channel names defining a region of interest. When set, data are first
         averaged across those channels and a single scalar SME is returned.
@@ -66,19 +75,23 @@ def compute_sme(
         This is equivalent to the standard error of the mean.
     n_samples : int | None
         Number of trials to draw (with replacement) per bootstrap iteration.
-        If ``None``, uses the number of trials in the condition (or the
-        smaller condition for 'diff' mode is kept independent). Capped at the
-        number of available trials per condition.
+        If ``None``, the number of trials of the condition (in 'diff' mode,
+        each condition uses its own number of trials). Capped at the number
+        of available trials per condition. Ignored when ``n_iter`` is None.
     relative : bool
         If ``True``, return the SME relative to the mean score (i.e., SME
         divided by the absolute value of the mean x 100). Default is ``False``.
         The mean score is computed on the original (non-resampled) data, so
         this only affects the final scaling of the SME. The absolute value is
         used in the denominator to avoid sign effects when the mean amplitude
-        is negative.
+        is negative. Unstable when the mean score is close to zero (e.g. a
+        baseline-corrected window without a clear component).
     random_state : int | numpy.random.Generator | None
         Seed or generator for reproducibility. Passed to
         ``numpy.random.default_rng()``.
+    return_ch_names : bool
+        If ``True`` (per-channel mode only), also return the names of the
+        channels the SME values belong to. Default is ``False``.
 
     Returns
     -------
@@ -87,13 +100,18 @@ def compute_sme(
         score computed on the original (non-resampled) data. Returns a scalar
         ``float`` when ``roi`` is set, or a ``numpy.ndarray`` of shape
         ``(n_channels,)`` when operating in per-channel mode.
+    ch_names : list of str
+        Only with ``return_ch_names=True`` (per-channel mode).
 
     Notes
     -----
-    The SME is computed using bootstrapping rather than the analytic formula
-    (``SD / sqrt(N)``), following the approach described in :footcite:t:`LuckEtAl2021`.
-    This makes it applicable to any ERP score derived from averaged waveforms,
-    not just time-window mean amplitude.
+    By default the SME is computed by bootstrapping, following
+    :footcite:t:`LuckEtAl2021`; for the time-window mean amplitude used here
+    the analytic formula (``n_iter=None``, ``SD / sqrt(N)``) gives the same
+    value up to bootstrap noise and is much faster.
+
+    All epochs of ``epochs`` are used: with ``EpochsAPICE``, call
+    ``remove_bad_epochs()`` (or select the good epochs) first.
 
     The score used here is the time-window mean amplitude, averaged across the
     time window defined by ``start`` and ``stop``. For per-channel mode each
@@ -200,10 +218,16 @@ def compute_sme(
             return data.mean(axis=1).mean(axis=1)  # (n_trials,)
         else:
             # Per-channel mode: average across time only
-            data = ep.get_data(picks=picks, tmin=start, tmax=stop)
+            data = ep.get_data(picks=chan_picks, tmin=start, tmax=stop)
             # data: (n_trials, n_channels, n_timepoints)
             return data.mean(axis=2)  # (n_trials, n_channels)
 
+    # resolve the channels once, with the rule epochs.get_data() uses (a
+    # channel type excludes info['bads'], names do not), and select by name:
+    # the values and the returned names then always match
+    if roi is None:
+        idx = _picks_to_idx(epochs1.info, "eeg" if picks is None else picks, exclude="bads")
+        chan_picks = [epochs1.ch_names[i] for i in idx]
     scores1 = _get_scores(epochs1)
     n_trials1 = scores1.shape[0]
     n_s1 = n_trials1 if n_samples is None else min(n_trials1, int(n_samples))
@@ -278,4 +302,6 @@ def compute_sme(
     if roi is not None:
         return float(sme)
 
+    if return_ch_names:
+        return sme, list(chan_picks)
     return sme

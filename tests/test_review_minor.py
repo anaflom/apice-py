@@ -105,3 +105,31 @@ def test_run_algorithms_does_not_modify_the_user_config():
     before = dict(cfg.cfg["g"]["algorithms"]["A"]["parameters"])
     quiet(run_algorithms, r, cfg.cfg)
     assert cfg.cfg["g"]["algorithms"]["A"]["parameters"] == before
+
+
+# ------------------------------------------- detection study (2026-11) bugs
+def _raw_apice():
+    raw, _ = SyntheticEEG(32, duration=10, seed=0).build()
+    return quiet(RawAPICE, raw)
+
+
+def test_zero_threshold_is_a_real_threshold():
+    """A threshold of 0 was treated as 'no threshold' (if thresh[i]:)."""
+    from apice.artifacts_detection import reject_absolute, reject_relative, reject_relative_per_cha
+    r = _raw_apice()
+    x = r._data.copy()
+    rej, _, _ = reject_absolute(x, [None, 0])
+    assert 0.4 < rej.mean() < 0.6                      # about half the samples are > 0
+    rej, _, _ = reject_relative(x, r.artifacts, [None, 0])
+    assert 0.2 < rej.mean() < 0.3                      # above Q3
+    rej, _, _ = reject_relative_per_cha(x, r.artifacts, [None, 0])
+    assert 0.2 < rej.mean() < 0.3
+    rej, _, _ = reject_absolute(x, [None, None])       # None still means no threshold
+    assert not rej.any()
+
+
+def test_default_artifact_detection_config_exists():
+    """detect_artifacts(cfg=None) / run_algorithms(cfg=None) loaded missing files."""
+    r = _raw_apice()
+    quiet(r.detect_artifacts)
+    quiet(run_algorithms, _raw_apice())

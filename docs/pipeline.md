@@ -583,7 +583,7 @@ All IO utilities are in `apice/io.py`.
 
 ### 9. ERP Statistics
 
-`compute_sme` (in `apice/statistics.py`, exposed as `apice.compute_sme`) computes the **Standardised Measurement Error** (SME; [Luck et al. 2021](https://doi.org/10.1111/psyp.13793)) — a bootstrap-based index of how reliably a mean-amplitude ERP measure can be estimated from the available trials. Lower SME indicates more stable ERP estimates.
+`compute_sme` (in `apice/erp_statistics.py`, exposed as `apice.compute_sme`) computes the **Standardised Measurement Error** (SME; [Luck et al. 2021](https://doi.org/10.1111/psyp.13793)) — a bootstrap-based index of how reliably a mean-amplitude ERP measure can be estimated from the available trials. Lower SME indicates more stable ERP estimates.
 
 ```python
 from apice import compute_sme

@@ -375,7 +375,8 @@ def run_algorithms(raw, cfg: str | Path | dict = None, force_cfg=False, l_freq=N
     # Set the configuration based on the input type (None, JSON file path, or dictionary)
     if cfg is None:
         # get the path of the default configuration file
-        default_cfg_path = Path(__file__).parent / "default_cfg" / 'artifacts_config.json'
+        # the default artifact detection of the pipeline ('artifacts_config.json' did not exist)
+        default_cfg_path = Path(__file__).parent / "default_cfg" / 'detect_artifacts_motion_config.json'
         artcfg = ArtifactsConfiguration().load_from_json(default_cfg_path)
     elif isinstance(cfg, (str, Path)):
         artcfg = ArtifactsConfiguration().load_from_json(cfg)
