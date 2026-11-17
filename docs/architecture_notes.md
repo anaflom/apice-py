@@ -41,6 +41,13 @@ of manual bad channels rather than merging everything into `info['bads']`).
   xfail test `tests/test_roundtrip.py::test_raw_roundtrip_bc_not_implied_by_bct`;
   remove the marker when the redesign fixes it.
 - There is no `BTmanual`: bad times are always fully derived from BCT.
+- `define_bcbt(keep_rejected_previous='bt'|'bc')` only works with
+  `bcbt_method='fix'`; with the default `'functional'` it is ignored (with a
+  warning since 2026-11). Forced / manual BT and BC belong in this redesign.
+- `EpochsAPICE` keeps its masks in sync with MNE selections (epochs[...],
+  drop, pick, crop, decimate, resample, add_channels) by overriding
+  `_getitem`, `_pick_drop_channels` and the time methods (bug review #11).
+  A composition design would replace these overrides by `align_to(inst)`.
 - Similar provenance already exists for bad epochs: `rejection_reasons` keeps
   a set of reasons per epoch.
 

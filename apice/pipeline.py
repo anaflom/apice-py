@@ -264,19 +264,15 @@ def run_preprocessing(input_dir,
             
             # Run APICE ICA correction (remove big artifacted segments and bad channels before ICA fitting)
             if apply_ica:
-                raw, _, _ = clean_ica(raw, 
-                                      **ica_parameters,
-                                        create_report=True,
-                                        save_data=False,
-                                        save_report=False,
-                                        save_ica=True,
-                                        save_cfg=True,
-                                        save_log=False,
-                                        output_dir=output_dir,
-                                        file_name=file_name,
-                                        report=shared_report,
-                                        logger=shared_logger,
-                                        )
+                # defaults the user may override, then the arguments the batch
+                # run controls (passing any of them in ica_parameters used to
+                # raise "got multiple values for keyword argument")
+                ica_kwargs = dict(create_report=True, save_ica=True, save_cfg=True)
+                ica_kwargs.update(ica_parameters)
+                ica_kwargs.update(save_data=False, save_report=False, save_log=False,
+                                  output_dir=output_dir, file_name=file_name,
+                                  report=shared_report, logger=shared_logger)
+                raw, _, _ = clean_ica(raw, **ica_kwargs)
 
             # Run APICE default preprocessing pipeline
             was_interactive = plt.isinteractive()
@@ -715,6 +711,7 @@ def preprocess_initial_steps(raw,
     Filter(raw, l_freq=l_freq, h_freq=None, n_jobs=n_jobs)    
 
     # Optional line noise filter
+    zap_fig = None
     if line_noise_freq is not None: 
         zap_worker = ZapLine(raw, fline=line_noise_freq, chunk_duration=30, n_jobs=n_jobs)
         raw, zap_fig = zap_worker.apply(raw)
@@ -729,12 +726,13 @@ def preprocess_initial_steps(raw,
             report.add_raw(raw, title="Preprocess Initial Steps - Output Data", psd=False, butterfly=False, replace=True)
         except Exception as e:
             print(f"Warning: Could not add raw overview to report: {e}")
-        try:
-            report.add_figure(zap_fig, "ZapLine Spectral Power",
-                                section="Preprocess Initial Steps - Output Data", replace=True)
-            plt.close(zap_fig)
-        except Exception as e:
-            print(f"Warning: Could not add ZapLine figure to report: {e}")
+        if zap_fig is not None:
+            try:
+                report.add_figure(zap_fig, "ZapLine Spectral Power",
+                                    section="Preprocess Initial Steps - Output Data", replace=True)
+                plt.close(zap_fig)
+            except Exception as e:
+                print(f"Warning: Could not add ZapLine figure to report: {e}")
         try:
             fmax_post = raw.info['sfreq'] / 2
             fig_psd_post = raw.compute_psd(method='welch', fmax=fmax_post).plot(show=False)
@@ -754,7 +752,11 @@ def preprocess_initial_steps(raw,
     if save_data:
         print("Saving initial preprocessed raw data")
         full_path = output_dir / (file_name + preprocessed_data_suffix + ".fif")
-        raw.export(full_path, overwrite=True)
+        if isinstance(raw, RawAPICE):
+            raw.export(full_path, overwrite=True)
+        else:
+            # a plain MNE Raw: its export() writes other formats (EDF, BrainVision...)
+            raw.save(full_path, overwrite=True)
 
     # Save configuration
     if save_cfg:
@@ -1604,56 +1606,42 @@ def convert_stim_channels_to_annotations(raw):
     None
         Updates ``raw.annotations`` in place.
     """
-    # Get a copy of the original annotations
-    df_annotations = raw.annotations.to_data_frame(time_format=None)
-    
-    # Convert stim channels to annotations
+    # Events are found on each stim channel separately and labelled with that
+    # channel's name. This replaces a single find_events over all stim
+    # channels, which (bug review) mapped the event code k to the k-th stim
+    # channel with a bound on ALL channels (KeyError for other codes),
+    # mislabelled overlapping triggers (codes are summed), and built onsets
+    # from absolute samples without first_samp / orig_time handling.
     print("\nConverting STIMs to annotations...")
-    
-    stims = raw.copy().pick('stim')
-    
-    if stims:
+    stim_names = [raw.ch_names[i] for i in mne.pick_types(raw.info, meg=False, stim=True)]
+    if not stim_names:
+        return
 
-        # Detect all events
-        from mne import find_events
-        events = find_events(raw, stim_channel=stims.ch_names, verbose=False)
-        
-        # Assuming event IDs are directly the data values in the stim channel
-        event_ids = np.unique(events[:, 2])  # Unique event identifiers
-        
-        onsets = events[:, 0] / raw.info['sfreq']  # Convert sample indices to times
-        
-        ch_names = [()] * len(events)
-        
-        durations = [get_stim_duration(raw)] * len(events) 
-        
-        event_map = {event_id: f"{stims.ch_names[event_id - 1]}" for event_id in event_ids if event_id < len(raw.ch_names)}
-        
-        descriptions = [event_map[event_id] for event_id in events[:, 2]]
+    duration = get_stim_duration(raw)
+    ann = raw.annotations    # appended in place: MNE's internal time convention
+                             # (onset = absolute sample / sfreq, with or without
+                             # meas_date); set_annotations would re-anchor them
+    for name in stim_names:
+        events = mne.find_events(raw, stim_channel=name, verbose=False)
+        if len(events) == 0:
+            continue
+        # one code per channel (e.g. EGI DINs): the channel name; a channel
+        # carrying several codes (a combined trigger channel): name/code
+        codes = np.unique(events[:, 2])
+        desc = [name if codes.size == 1 else f"{name}/{int(c)}" for c in events[:, 2]]
+        ann.append(onset=events[:, 0] / raw.info['sfreq'],
+                   duration=[duration] * len(events), description=desc)
 
-        # Create Annotations object
-        df_annotations_from_stims = pd.DataFrame(dict(onset=onsets, duration=durations, description=descriptions, ch_names=ch_names))
-        
-        # List of DataFrames to combine
-        dfs = [df_annotations, df_annotations_from_stims]
-        
-        # Filter out empty DataFrames
-        dfs = [df for df in dfs if not df.empty]
-        
-        if dfs:
-            # Concatenating DataFrames
-            df_combined = pd.concat(dfs, ignore_index=True)
-
-            # Dropping duplicates and sorting by 'onset'
-            df_final = df_combined.drop_duplicates().sort_values(by="onset").reset_index(drop=True)
-
-            from mne import Annotations 
-            annotations = Annotations(onset=list(df_final["onset"]),
-                                        duration=list(df_final["duration"]),
-                                        description=list(df_final["description"]),
-                                        ch_names=list(df_final["ch_names"]))
-            
-            raw.set_annotations(annotations)
+    # drop exact duplicates (e.g. stim events that were already annotations;
+    # MNE keeps annotations sorted, so the new ones are not simply at the end)
+    seen, drop = set(), []
+    for i, (on, du, de, ch) in enumerate(zip(ann.onset, ann.duration, ann.description, ann.ch_names)):
+        key = (round(float(on), 6), round(float(du), 6), de, tuple(ch))
+        if key in seen:
+            drop.append(i)
+        seen.add(key)
+    if drop:
+        ann.delete(drop)
     
 
 def generate_metadata_for_epochs(raw, 
@@ -1718,7 +1706,22 @@ def generate_metadata_for_epochs(raw,
     else:
         metadata = metadata_
     metadata = metadata.reset_index(drop=True)
-    
+
+    # One row per SEGMENTATION event, matched by sample. The rows of
+    # make_metadata follow the metadata events; they were used as they were,
+    # so if the two event sets differed (another regexp, events missing from
+    # one of them) every row after the first difference was misaligned.
+    row_samples = np.asarray(events[:, 0])
+    segm_samples = np.asarray(events_segm[:, 0])
+    if not np.array_equal(row_samples, segm_samples):
+        pos = {int(s): i for i, s in enumerate(row_samples)}
+        idx = [pos.get(int(s), -1) for s in segm_samples]
+        n_missing = sum(i < 0 for i in idx)
+        metadata = metadata.reindex([i if i >= 0 else -1 for i in idx]).reset_index(drop=True)
+        print(f"Warning: metadata events and segmentation events differ; metadata rows were "
+              f"matched to the {len(segm_samples)} segmentation events by sample "
+              f"({n_missing} without metadata, filled with NaN).")
+
     return metadata
     
 

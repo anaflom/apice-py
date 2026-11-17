@@ -421,6 +421,11 @@ def running_mean(x, N):
     numpy.ndarray
         Running average with same shape as input (edge-padded).
     """
+    # a window shorter than one sample (wind * sfreq < 1) is the data itself;
+    # N = 0 used to fail (cumsum[:-0] is empty)
+    N = int(N)
+    if N <= 1:
+        return np.asarray(x, dtype=float).copy()
     if N % 2 ==0:
         x_ini = np.full(int(N/2), x[0])
         x_end = np.full(int(N/2), x[-1])
@@ -911,17 +916,23 @@ class Power(DetectionMethod):
 class ChannelCorr(DetectionMethod):
     """Detect bad channels via low inter-channel correlation.
 
-    Identifies channels that show systematically low correlation with their
-    neighbors, indicating dead/disconnected electrodes or systematic artifacts.
+    Identifies channels that show systematically low correlation with the
+    other channels, indicating dead/disconnected electrodes or systematic
+    artifacts. In each time window, the absolute correlation of each channel
+    with every other channel is computed, and the mean of its highest
+    correlations is kept (as the MATLAB ``eega_tRejCorrCh``).
 
     Parameters
     ----------
-    threshold : float
-        Minimum correlation threshold.
-    method : str, default='mean'
-        Correlation metric ('mean', 'median', 'min').
-    iq_half : bool, default=False
-        Use IQR/2 for relative thresholding.
+    time_window, time_window_step : float, default=10, 5
+        Window length and step in seconds.
+    top_channel_corr : float, default=5
+        PERCENTAGE (not a number of channels) of the highest correlations
+        averaged per channel: correlations above the ``100 - top_channel_corr``
+        percentile. With few channels this is very few correlations (with
+        32 channels, 5 % is about 1-2).
+    thresh : float, default=0.4
+        Channels whose mean top correlation is below this value are rejected.
 
     See Also
     --------
@@ -1093,15 +1104,15 @@ class FlatChannel(DetectionMethod):
         
         # Reject data 
         thresh = [None, self.params_reject['thresh']]
-        bct, rl_sum, ru_sum = reject_data(self._data.copy(), raw, thresh, 
+        bct, rl_sum, ru_sum = reject_data(self._data.copy(), raw, thresh,
                                           rejection='absolute',
                                           remove_bct=self.params_reject['remove_bct'],
                                           remove_bt=self.params_reject['remove_bt'],
                                           remove_bc=self.params_reject['remove_bc'],
                                           )
-        
-        # steps after rejection
-        bct, raw = self._steps_post_reject(raw, bct, show_rej={'lower threshold': rl_sum})
+
+        # steps after rejection (only an upper threshold is used)
+        bct, raw = self._steps_post_reject(raw, bct, show_rej={'upper threshold': ru_sum})
         
         return raw, bct
 

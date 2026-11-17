@@ -1312,11 +1312,22 @@ def _modify_rej(rej, segment_samples, max_samples):
     segment_samples = max(1, int(segment_samples))
     seg = np.arange(0, n_samples, segment_samples)
 
+    # a block is also taken for a channel when it overlaps a bad run of that
+    # channel longer than max_samples: otherwise an artifact long enough to be
+    # interpolated was skipped when it straddled a block boundary (e.g. 80 ms
+    # split 40/40 with max_samples = 50 ms; bug review #15)
+    rej_b = np.asarray(rej, dtype=bool)
+    long_run = np.zeros(rej_b.shape, dtype=bool)
+    for ch in range(rej_b.shape[0]):
+        for a, b in _true_runs(rej_b[ch]):
+            if b - a > max_samples:
+                long_run[ch, a:b] = True
+
     # iterate over segments
     for segi in seg:
         m = rej[:,segi:segi+segment_samples]
         nreji = np.sum(m,axis=1)
-        idx_ch_rej = nreji>max_samples
+        idx_ch_rej = (nreji>max_samples) | np.any(long_run[:, segi:segi+segment_samples], axis=1)
         rej_out[idx_ch_rej, segi:segi+segment_samples] = 1
 
     return rej_out
@@ -2122,7 +2133,9 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
         if requested_mode == 'auto':
             n_segments = int(np.shape(badIntervals)[0])
             n_jobs = self.params['n_jobs']
-            n_jobs = os.cpu_count() or 1 if n_jobs in (-1, None) else max(1, int(n_jobs))
+            # parenthesised: `a or 1 if c else d` parsed as `a or (1 if c else d)`,
+            # so n_jobs was ignored
+            n_jobs = (os.cpu_count() or 1) if n_jobs in (-1, None) else max(1, int(n_jobs))
             avg_channels_to_interpolate = np.mean([np.sum(x) for x in chaInterpolate]) if n_segments else 0
             max_channels_allowed = self.params['p'] * n_channels
             if n_segments >= max(8, 2 * n_jobs) and avg_channels_to_interpolate <= max_channels_allowed:

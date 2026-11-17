@@ -1,6 +1,6 @@
 """Regression tests for artifact-correction bugs.
 
-Bug-review findings #1, #10 and #21 (2026-11).
+Bug-review findings #1, #10, #15, #21 and #24 (2026-11).
 """
 
 import numpy as np
@@ -57,3 +57,34 @@ def test_segment_spline_without_save_corrected_keeps_bct():
     assert before.any()
     quiet(SegmentSphericalSplineInterpolation(save_corrected=False).correct, r)
     np.testing.assert_array_equal(np.asarray(r.artifacts.BCT), before)
+
+
+def test_modify_rej_keeps_a_long_run_straddling_two_blocks():
+    """#15: an 80-sample run split 40/40 across a block boundary (limit 50
+    per block) was not interpolated at all."""
+    rej = np.zeros((2, 400), dtype=int)
+    rej[0, 160:240] = 1                               # blocks [100,200) and [200,300)
+    rej[1, 10:40] = 1                                 # short run: still ignored
+    out = _modify_rej(rej, segment_samples=100, max_samples=50)
+    assert out[0, 100:300].all() and not out[0, :100].any() and not out[0, 300:].any()
+    assert not out[1].any()
+
+
+def test_target_pca_no_bad_epoch_on_epochs():
+    """#24: all_epochs='no_bad_epoch' failed with the old (n,1,1) BE shape;
+    the bad epoch must be left untouched."""
+    import mne
+    from apice import EpochsAPICE
+    from apice.artifacts_correction import TargetPCA
+    rng = np.random.default_rng(3)
+    n_ep, n_ch, n_s, sf = 4, 8, 500, 250.0
+    data = rng.normal(0, 5e-6, (n_ep, n_ch, n_s))
+    data[:, :, 200:212] += rng.normal(0, 1, (n_ch, 1)) * 100e-6     # shared artifact
+    ep = mne.EpochsArray(data, mne.create_info(n_ch, sf, "eeg"), verbose="ERROR")
+    e = quiet(EpochsAPICE, ep)
+    e.artifacts.BCT[:, :, 200:212] = True
+    e.artifacts.BE[1] = True
+    before = e._data.copy()
+    quiet(TargetPCA(all_epochs="no_bad_epoch", max_time=0.1).correct, e)
+    np.testing.assert_array_equal(e._data[1], before[1])
+    assert not np.allclose(e._data[0], before[0])

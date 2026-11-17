@@ -418,7 +418,8 @@ def run_algorithms(raw, cfg: str | Path | dict = None, force_cfg=False, l_freq=N
         alg_obj = []
         for algorithm_name, algorithm_info in algorithms_detection:
             class_name = algorithm_info['class_name']
-            parameters = algorithm_info['parameters']
+            # a copy: the user's configuration must not be modified
+            parameters = dict(algorithm_info['parameters'])
             parameters["name"] = algorithm_name
             parameters["group_name"] = group_name
             print(f"\n > Group {group_name} - Algorithm: {algorithm_name} (Class: {class_name})")
@@ -450,7 +451,7 @@ def run_algorithms(raw, cfg: str | Path | dict = None, force_cfg=False, l_freq=N
             for (algorithm_name, algorithm_info), alg_obj_i in zip(algorithms_detection, alg_obj):
                 
                 # run the algorithm and get the new BCT
-                print(f"\n > Group {group_name} - Loop {loop_counter} - Algorithm: {algorithm_name} (Class: {class_name})")
+                print(f"\n > Group {group_name} - Loop {loop_counter} - Algorithm: {algorithm_name} (Class: {algorithm_info['class_name']})")
                 raw, bct = alg_obj_i.reject(raw)
                 perc_detected = np.sum(bct) / np.size(bct) * 100
                 perc_new_detected = np.sum(np.logical_and(bct, np.logical_not(raw.artifacts.BCT))) / np.size(bct) * 100
@@ -480,7 +481,8 @@ def run_algorithms(raw, cfg: str | Path | dict = None, force_cfg=False, l_freq=N
         print("-"*30)
         for algorithm_name, algorithm_info in algorithms_post_detection:
             class_name = algorithm_info['class_name']
-            parameters = algorithm_info['parameters']
+            # a copy: the user's configuration must not be modified
+            parameters = dict(algorithm_info['parameters'])
             parameters["name"] = algorithm_name
             parameters["group_name"] = group_name
             print(f"\n > Group {group_name} - Algorithm: {algorithm_name} (Class: {class_name})")

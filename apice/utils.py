@@ -135,7 +135,8 @@ def reject_short_good_segments_1d(bt, samples_limit):
     bt : array-like of bool
         Boolean vector where True marks bad samples.
     samples_limit : int
-        Maximum good-segment length (in samples) that will be rejected.
+        Good segments of at most this many samples (``<=``) are rejected,
+        as in the MATLAB ``eega_tRejShortGood``.
 
     Returns
     -------
@@ -175,7 +176,8 @@ def include_short_bad_segments_1d(bt, samples_limit):
     bt : array-like of bool
         Boolean vector where True marks bad samples.
     samples_limit : int
-        Maximum bad-segment length (in samples) that will be restored.
+        Bad segments shorter than this many samples (``<``) are restored,
+        as in the MATLAB ``eega_tIncShortBad``.
 
     Returns
     -------

@@ -152,6 +152,33 @@ def _ica_artifact_estimate(ica, inst, components):
     return artifacts
 
 
+def _picks_to_indices(raw, picks):
+    """Channel indices for ``picks``: channel names and/or channel types
+    (e.g. 'eeg' or ['eeg', 'eog']), or indices. A single string used to be
+    iterated character by character."""
+    if isinstance(picks, str):
+        picks = [picks]
+    picks = list(picks)
+    if all(isinstance(p, (int, np.integer)) for p in picks):
+        return [int(p) for p in picks]
+    types = raw.get_channel_types()
+    wanted = set(p for p in picks if isinstance(p, str))
+    return [i for i, (ch, tp) in enumerate(zip(raw.ch_names, types))
+            if ch in wanted or tp in wanted]
+
+
+def _fit_span(raw, start, stop):
+    """Sample span [i0, i1) used by ``ICA.fit(start=..., stop=...)``: ints are
+    samples, floats are seconds (as in MNE)."""
+    def to_index(v, default):
+        if v is None:
+            return default
+        if isinstance(v, (float, np.floating)):
+            return int(raw.time_as_index(v, use_rounding=True)[0])
+        return int(v)
+    return to_index(start, 0), to_index(stop, raw.n_times)
+
+
 def clean_ica(raw,
               cfg_artifacts_detection=None,
               cfg_bcbt=None,
@@ -480,8 +507,8 @@ def clean_ica(raw,
     # Get the picks for ICA fitting
     if picks_ica is None:
         picks_ica = mne.pick_types(raw_ica.info, meg=False, eeg=True, eog=True, ecg=True)
-    elif all(isinstance(p, str) for p in picks_ica):
-        picks_ica = mne.pick_channels(raw_ica.ch_names, include=picks_ica, ordered=False)
+    else:
+        picks_ica = _picks_to_indices(raw_ica, picks_ica)
     picks_ica = [i for i in picks_ica if raw_ica.ch_names[i] not in raw_ica.info['bads']]
     if exclude_ica is not None:
         picks_ica = [i for i in picks_ica if raw_ica.ch_names[i] not in exclude_ica]
@@ -523,7 +550,11 @@ def clean_ica(raw,
     
     # define the number of n_components
     if n_components == 'auto':
-        n_samples = (raw_ica_apice.artifacts.BT == False).sum()  # number of samples not marked as bad for ICA fitting
+        # samples not marked as bad, within the fitted span (start_fit/stop_fit
+        # were ignored here, so the rule could allow too many components)
+        good = np.ravel(raw_ica_apice.artifacts.BT == False)
+        i0, i1 = _fit_span(raw_ica, start_fit, stop_fit)
+        n_samples = int(good[i0:i1].sum())
         n_channels = len(picks_ica)
         if use_avg_ref:
             n_channels -= 1  # the average reference reduces the rank of the data by one
@@ -606,8 +637,12 @@ def clean_ica(raw,
     # Add some plots to the report to visualize the results of ICA
     if report is not None:
         # Plot the ICA components 
-        fig_components = ica.plot_components(inst=raw_ica, show=False)
         try:
+            fig_components = ica.plot_components(inst=raw_ica, show=False)
+            # a single figure (not a list) when there are <= 20 components,
+            # which used to be iterated over and silently dropped
+            if not isinstance(fig_components, (list, tuple)):
+                fig_components = [fig_components]
             for i, f in enumerate(fig_components):
                 report.add_figure(f, "ICA component", section="ICA", replace=False)
                 plt.close(f)
@@ -635,8 +670,8 @@ def clean_ica(raw,
                 print(f"Warning: Could not add ICLabel classification table to report: {e}")
         # Plot the properties of the components to exclude
         for idx in components_to_exclude:
-            fig_properties = ica.plot_properties(raw_ica, picks=idx, show=False)
             try:
+                fig_properties = ica.plot_properties(raw_ica, picks=idx, show=False)
                 comp_label = ic_labels['labels'][idx]
                 report.add_figure(fig_properties, f"ICA component {idx}, type {comp_label}", section="ICA", replace=False)
                 for f in fig_properties:
@@ -656,8 +691,8 @@ def clean_ica(raw,
         mid_point = raw.times[0] + ((raw.times[-1] - raw.times[0]) / 2)
         start = max(raw.times[0], mid_point - 15)  # 15 seconds before the midpoint
         stop = min(raw.times[-1], start + 30)  # 30 seconds window
-        fig_overlay = ica.plot_overlay(raw_ref_ica, exclude=components_to_exclude, picks="eeg", start=start, stop=stop, show=False)
         try:
+            fig_overlay = ica.plot_overlay(raw_ref_ica, exclude=components_to_exclude, picks="eeg", start=start, stop=stop, show=False)
             report.add_figure(fig_overlay, "Original and Clean Signal", section="ICA", replace=False)
             plt.close(fig_overlay)
         except Exception as e:

@@ -187,11 +187,19 @@ class RawAPICE(mne.io.RawArray):
         -------
         None
         """
-        # rejection matrix to annotations
-        self.annotate_bads(channels=True, times=True, data=True, corrected=True)
-        # save preprocessed raw
-        full_path = Path(full_path)
-        self.save(full_path, overwrite=overwrite)
+        # rejection matrix to annotations, only for the saved file: the
+        # in-memory object keeps its annotations and bads (otherwise the
+        # 'artifact' / 'badtime' / 'corrected' annotations stayed and could be
+        # picked up as events by events_from_annotations(regexp=...))
+        annotations_backup = self.annotations.copy()
+        bads_backup = list(self.info['bads'])
+        try:
+            self.annotate_bads(channels=True, times=True, data=True, corrected=True)
+            full_path = Path(full_path)
+            self.save(full_path, overwrite=overwrite)
+        finally:
+            self.set_annotations(annotations_backup)
+            self.info['bads'] = bads_backup
 
     def bc_to_bads(self):
         """Copy bad-channel flags from artifact masks into ``info['bads']``.
@@ -986,6 +994,54 @@ class EpochsAPICE(mne.EpochsArray):
         # Initialize artifacts structure
         self.artifacts = ArtifactsEpochs(self, **kwargs)
         self.define_bcbt()
+
+    # ------------------------------------------------------------------
+    # MNE operations that change epochs, channels or samples also update
+    # the artifact masks (bug review #11). Epoch selection (epochs[...],
+    # drop, drop_bad, equalize_event_counts) goes through _getitem; channel
+    # pick / drop / reorder through _pick_drop_channels.
+    # ------------------------------------------------------------------
+
+    def _getitem(self, item, reason="IGNORED", copy=True, drop_event_id=True,
+                 select_data=True, return_indices=False):
+        n_before = len(self.events)
+        inst, idx = super()._getitem(item, reason=reason, copy=copy, drop_event_id=drop_event_id,
+                                     select_data=select_data, return_indices=True)
+        if getattr(inst, 'artifacts', None) is not None:
+            # idx can be an index array, a boolean mask, a slice or an int
+            inst.artifacts._select_epochs(np.atleast_1d(np.arange(n_before)[idx]))
+        return (inst, idx) if return_indices else inst
+
+    def _pick_drop_channels(self, idx, *, verbose=None):
+        out = super()._pick_drop_channels(idx, verbose=verbose)
+        if getattr(self, 'artifacts', None) is not None:
+            self.artifacts._select_channels(self.ch_names)
+        return out
+
+    def add_channels(self, add_list, force_update_info=False):
+        out = super().add_channels(add_list, force_update_info=force_update_info)
+        if getattr(self, 'artifacts', None) is not None:
+            self.artifacts._select_channels(self.ch_names)
+        return out
+
+    def _sync_artifact_times(self, resampled=False):
+        if getattr(self, 'artifacts', None) is not None:
+            self.artifacts._select_times(self.times, self.info['sfreq'], resampled=resampled)
+
+    def crop(self, *args, **kwargs):
+        out = super().crop(*args, **kwargs)
+        self._sync_artifact_times()
+        return out
+
+    def decimate(self, *args, **kwargs):
+        out = super().decimate(*args, **kwargs)
+        self._sync_artifact_times()
+        return out
+
+    def resample(self, *args, **kwargs):
+        out = super().resample(*args, **kwargs)
+        self._sync_artifact_times(resampled=True)
+        return out
 
     def update_artifacts_params(self, **kwargs):
         """Update artifact parameter values in-place.
@@ -1892,23 +1948,9 @@ class EpochsAPICE(mne.EpochsArray):
                 for r in self.artifacts.rejection_reasons
             ])
 
-        # Drop the selected epochs from the epochs data
-        self.drop(to_drop, reason='bad epoch')
+        # Drop the selected epochs; the artifact matrices follow (_getitem)
+        self.drop(np.asarray(to_drop, dtype=bool), reason='bad epoch')
 
-        # Update the artifacts matrices to reflect the removal of the dropped epochs
-        good_epochs = ~to_drop
-        self.artifacts.n_epochs = np.sum(good_epochs)
-        self.artifacts.BE = self.artifacts.BE[good_epochs]
-        self.artifacts.BCT = self.artifacts.BCT[good_epochs, :, :]
-        self.artifacts.BT = self.artifacts.BT[good_epochs, :, :]
-        self.artifacts.BC = self.artifacts.BC[good_epochs, :, :]
-        self.artifacts.CCT = self.artifacts.CCT[good_epochs, :, :]
-        self.artifacts.rejection_reasons = [
-            r for ep, r in enumerate(self.artifacts.rejection_reasons)
-            if good_epochs[ep]
-        ]
-        
-        
 
     def export(self, full_path, overwrite=False):
         """Export epochs to FIF and artifact annotations to CSV.

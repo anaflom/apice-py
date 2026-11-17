@@ -10,6 +10,7 @@ EEG data.
 # Import necessary modules
 import copy
 import mne  
+import warnings
 import numpy as np 
 from prettytable import PrettyTable 
 
@@ -908,7 +909,8 @@ class ArtifactsRaw(Artifacts):
         Parameters
         ----------
         keep_rejected_previous : {'bt', 'bc'} | None, default=None
-            Preserve previously rejected times or channels before recomputing.
+            Preserve previously rejected times or channels before recomputing
+            (``bcbt_method='fix'`` only; ignored with a warning otherwise).
         plot_rejection_matrix : bool, default=False
             If True, display the resulting artifact structure figure.
 
@@ -922,6 +924,12 @@ class ArtifactsRaw(Artifacts):
         # Select algorithm and compute BC/BT
         method = self.params.get('bcbt_method', 'functional')
         if method == 'functional':
+            if keep_rejected_previous is not None:
+                # not supported by the fixed-point method (forced bad times /
+                # channels belong to the provenance revision, see
+                # docs/architecture_notes.md); it used to be ignored silently
+                warnings.warn("keep_rejected_previous is ignored with bcbt_method='functional' "
+                              "(only manual bad channels, BCmanual, are kept)", stacklevel=2)
             bc, bt, _ = define_bcbt_functional(
                 self.BCT,
                 self.params['thresh_bad_times'],
@@ -1173,6 +1181,78 @@ class ArtifactsEpochs(Artifacts):
         self.BE = np.full(self.n_epochs, False)
         self.rejection_reasons = [set() for _ in range(self.n_epochs)]
 
+    # -------------------------------------------------- keep masks in sync
+    # Used by EpochsAPICE after MNE operations that select epochs, channels
+    # or samples (bug review #11), so the masks always match the data.
+
+    def _select_epochs(self, idx):
+        """Keep the epochs ``idx`` (indices into the current epochs)."""
+        idx = np.asarray(idx, dtype=int)
+        for key in ('BCT', 'BC', 'BT', 'CCT', 'BE'):
+            setattr(self, key, np.asarray(getattr(self, key))[idx])
+        self.rejection_reasons = [self.rejection_reasons[i] for i in idx]
+        self.n_epochs = int(idx.size)
+
+    def _select_channels(self, ch_names):
+        """Match the channel axis to ``ch_names``: channels kept / reordered,
+        new channels (not in the masks) start as good."""
+        old = list(self.ch_names)
+        pos = {ch: i for i, ch in enumerate(old)}
+        src = np.array([pos.get(ch, -1) for ch in ch_names], dtype=int)
+        new = src < 0
+
+        def take(a, axis):
+            out = np.take(a, np.where(new, 0, src), axis=axis)
+            if new.any():
+                sl = [slice(None)] * a.ndim
+                sl[axis] = new
+                out[tuple(sl)] = False
+            return out
+
+        for key in ('BCT', 'BC', 'CCT'):
+            setattr(self, key, take(np.asarray(getattr(self, key)), 1))
+        self.BCmanual = take(np.asarray(self.BCmanual), 0)
+        self.ch_names = list(ch_names)
+        self.n_channels = len(self.ch_names)
+
+    def _select_times(self, new_times, new_sfreq, resampled=False):
+        """Match the sample axis to ``new_times`` (crop, decimate, resample).
+
+        ``resampled=False`` (crop, decimate: samples are kept, not filtered):
+        each new sample takes the value of the current sample at its time.
+        ``resampled=True``: a new sample is bad if any current sample within
+        half a new sample period of it is bad (the nearest one if none is)."""
+        old_t = np.asarray(self.times, dtype=float)
+        new_t = np.asarray(new_times, dtype=float)
+        tol = 0.25 / float(self.sfreq)
+        near = np.clip(np.searchsorted(old_t, new_t), 1, old_t.size - 1)
+        near = np.where(np.abs(old_t[near - 1] - new_t) <= np.abs(old_t[near] - new_t), near - 1, near)
+        if not resampled:
+            if not np.all(np.abs(old_t[near] - new_t) <= tol):
+                raise ValueError("new sample times are not a subset of the current ones")
+            a, b = near, near + 1
+        else:
+            # window [t - half, t + half): a sample exactly on a boundary
+            # belongs to the later new sample, so none is lost
+            half = 0.5 / float(new_sfreq)
+            a = np.searchsorted(old_t, new_t - half - tol, side='left')
+            b = np.searchsorted(old_t, new_t + half - tol, side='right')
+            empty = b <= a
+            a = np.where(empty, near, a)
+            b = np.where(empty, near + 1, b)
+
+        def take(m):
+            m = np.asarray(m, dtype=bool)
+            cs = np.concatenate([np.zeros(m.shape[:-1] + (1,), dtype=np.int64),
+                                 np.cumsum(m, axis=-1, dtype=np.int64)], axis=-1)
+            return (cs[..., b] - cs[..., a]) > 0
+
+        for key in ('BCT', 'BT', 'CCT'):
+            setattr(self, key, take(getattr(self, key)))
+        self.times = new_t.copy()
+        self.n_samples = int(new_t.size)
+        self.sfreq = float(new_sfreq)
+
     def include_short_bad_segments(self, time_limit):
         """Restore very short bad segments in each epoch."""
         bt = self.BT.copy()
@@ -1210,7 +1290,8 @@ class ArtifactsEpochs(Artifacts):
         Parameters
         ----------
         keep_rejected_previous : {'bt', 'bc'} | None, default=None
-            Preserve previously rejected times or channels before recomputing.
+            Preserve previously rejected times or channels before recomputing
+            (``bcbt_method='fix'`` only; ignored with a warning otherwise).
         plot_rejection_matrix : bool, default=False
             If True, display the resulting artifact structure figure.
 
@@ -1224,6 +1305,12 @@ class ArtifactsEpochs(Artifacts):
         # Select algorithm and compute BC/BT
         method = self.params.get('bcbt_method', 'functional')
         if method == 'functional':
+            if keep_rejected_previous is not None:
+                # not supported by the fixed-point method (forced bad times /
+                # channels belong to the provenance revision, see
+                # docs/architecture_notes.md); it used to be ignored silently
+                warnings.warn("keep_rejected_previous is ignored with bcbt_method='functional' "
+                              "(only manual bad channels, BCmanual, are kept)", stacklevel=2)
             bc, bt, _ = define_bcbt_functional(
                 self.BCT,
                 self.params['thresh_bad_times'],
