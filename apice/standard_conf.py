@@ -136,7 +136,7 @@ def cfg_correction_target_pca(max_time=0.125, components_to_remove=None,
                                all_time='all', all_channel='no_bad_channel',
                                all_epochs='all', splice_method=1,
                                save_corrected=True, splice_undecidable='method1',
-                               splice_step_k=2.5, filename=None):
+                               splice_step_k=2.5, splice_max_gap=1.0, filename=None):
     cfg = {}
     cfg['max_time'] = max_time
     cfg['components_to_remove'] = components_to_remove
@@ -148,6 +148,7 @@ def cfg_correction_target_pca(max_time=0.125, components_to_remove=None,
     cfg['splice_method'] = splice_method
     cfg['splice_undecidable'] = splice_undecidable
     cfg['splice_step_k'] = splice_step_k
+    cfg['splice_max_gap'] = splice_max_gap
     cfg['save_corrected'] = save_corrected
 
     if filename is not None:
@@ -162,7 +163,7 @@ def cfg_correction_spline_segments(p=0.5, p_neighbors=1, min_good_time=1.00,
                                     min_segment_time=0.250, splice_method=1,
                                     parallelize_mode='auto', save_corrected=True,
                                     splice_undecidable='method1', splice_step_k=2.5,
-                                    filename=None):
+                                    splice_max_gap=1.0, filename=None):
     cfg = {}
     cfg['p'] = p
     cfg['p_neighbors'] = p_neighbors
@@ -173,6 +174,7 @@ def cfg_correction_spline_segments(p=0.5, p_neighbors=1, min_good_time=1.00,
     cfg['splice_method'] = splice_method
     cfg['splice_undecidable'] = splice_undecidable
     cfg['splice_step_k'] = splice_step_k
+    cfg['splice_max_gap'] = splice_max_gap
     cfg['parallelize_mode'] = parallelize_mode
     cfg['save_corrected'] = save_corrected
 

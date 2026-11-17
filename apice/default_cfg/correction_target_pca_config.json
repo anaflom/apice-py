@@ -9,5 +9,6 @@
     "splice_method": 1,
     "splice_undecidable": "method1",
     "splice_step_k": 2.5,
+    "splice_max_gap": 1.0,
     "save_corrected": true
 }

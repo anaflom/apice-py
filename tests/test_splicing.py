@@ -259,11 +259,11 @@ def test_adaptive_reports_its_decisions():
     x, y, I, F = _step_case()
     st = {}
     _splice(y, [[I, F]], "adaptive", stats=st)
-    assert st == {"step": 1, "no_step": 0, "undecidable": 0}
+    assert st == {"step": 1, "no_step": 0, "undecidable": 0, "long": 0}
     x = _clean(seed=5)
     st = {}
     _splice(_corrupt(x, 2000, 2250), [[2000, 2250]], "adaptive", stats=st)
-    assert st == {"step": 0, "no_step": 1, "undecidable": 0}
+    assert st == {"step": 0, "no_step": 1, "undecidable": 0, "long": 0}
 
 
 def _undecidable_step_case():
@@ -348,6 +348,74 @@ def test_many_short_marks_fall_back_and_remove_the_step():
     after = slice(F + 30, None)
     good = ~bct[after]
     assert _rms((ad[after] - x[after])[good]) < 40e-6      # the 200 uV step is removed
+
+
+# ------------------------------------------------------------- max_gap
+def _long_case(seed=14, length=2 * SF, level=150e-6):
+    """A long corrected segment (2 s) after which the level differs (e.g. slow
+    activity), with the interpolated data at yet another level."""
+    x = _clean(seed=seed)
+    I, F = 2000, 2000 + length
+    y = x.copy()
+    y[I:F] += 60e-6
+    y[F:] += level
+    return x, y, I, F
+
+
+@pytest.mark.parametrize("method", [1, "adaptive"])
+def test_long_segment_does_not_shift_the_data_after_it(method):
+    x, y, I, F = _long_case()
+    st = {}
+    out = _splice(y, [[I, F]], method, max_gap=SF, stats=st)
+    assert st["long"] == 1
+    np.testing.assert_array_equal(out[:I], y[:I])          # before: untouched
+    np.testing.assert_array_equal(out[F:], y[F:])          # after: untouched
+    # the segment keeps its shape and meets the data on both sides
+    np.testing.assert_allclose([out[I], out[F - 1]], [y[I - 1], y[F]], rtol=0, atol=1e-15)
+    np.testing.assert_allclose(np.diff(out[I:F] - y[I:F], 2), 0, atol=1e-18)
+
+
+@pytest.mark.parametrize("method", [1, "adaptive"])
+def test_max_gap_none_keeps_the_previous_behaviour(method):
+    x, y, I, F = _long_case()
+    a = _splice(y, [[I, F]], method)
+    b = _splice(y, [[I, F]], method, max_gap=None)
+    np.testing.assert_array_equal(a, b)
+    if method == 1:                                        # method 1 shifts after it
+        assert not np.array_equal(a[F:], y[F:])
+
+
+@pytest.mark.parametrize("method", [1, "adaptive"])
+def test_short_step_still_removed_with_max_gap(method):
+    """A brief jump (100 ms marked) is below max_gap: removed as before."""
+    x, y, I, F = _step_case()
+    st = {}
+    a = _splice(y, [[I, F]], method, max_gap=SF, stats=st)
+    b = _splice(y, [[I, F]], method)
+    np.testing.assert_array_equal(a, b)
+    assert st["long"] == 0
+
+
+def test_adaptive_long_bad_run_is_not_shifted():
+    """Per channel: a long run of bad samples (not corrected) is 'long' too."""
+    x, y, I, F = _long_case(seed=15)
+    bct = np.zeros(y.size, bool)
+    bct[I:F] = True
+    st = {}
+    out = _splice(y, [[100, 110]], "adaptive", bct=bct, corrected=np.zeros((1, y.size), bool),
+                  max_gap=SF, stats=st)
+    assert st["long"] == 1
+    np.testing.assert_array_equal(out[F:], y[F:])
+
+
+def test_corrections_accept_splice_max_gap_from_default_configs():
+    from apice.artifacts_correction import TargetPCA, SegmentSphericalSplineInterpolation
+    from apice.utils import get_cfg
+    for name, cls in (("correction_target_pca_config.json", TargetPCA),
+                      ("correction_spline_segments_config.json", SegmentSphericalSplineInterpolation)):
+        cfg = get_cfg(None, name)
+        assert cfg["splice_max_gap"] == 1.0
+        assert cls(**cfg).params["splice_max_gap"] == 1.0
 
 
 def test_matched_windows():

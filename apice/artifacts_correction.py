@@ -57,10 +57,16 @@ def _print_header(header, separator="="):
 SPLICE_METHODS = (1, 'trend', 'adaptive')
 
 
+def _max_gap_samples(seconds, sfreq):
+    """``splice_max_gap`` in samples (None: no limit)."""
+    return None if seconds is None else int(round(float(seconds) * sfreq))
+
+
 def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=1,
                      corrected=None, window=250, guard=5, order=1, align_bad_times=True,
                      step_window=1000, step_min=250, step_k=2.5, null_step=25,
-                     anchor='sample', anchor_window=25, undecidable='method1', stats=None):
+                     anchor='sample', anchor_window=25, undecidable='method1', stats=None,
+                     max_gap=None):
     """Splice corrected segments to reduce discontinuities at segment borders.
 
     Parameters
@@ -156,6 +162,15 @@ def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=
     null_step : int, default=25
         ``'adaptive'``: spacing (samples) of the positions in good data used
         to build the null distribution (callers pass ~0.1 s).
+    max_gap : int | None, default=None
+        Methods ``1`` and ``'adaptive'``: runs (``'adaptive'``: per channel)
+        or segments (method 1) longer than this many samples never shift the
+        data after them; they are only aligned at both edges (offset at the
+        start, linear ramp to the end, keeping their own shape). A level
+        difference across a long artifact is mostly slow activity, which the
+        high-pass filter applied after each correction removes, whereas a
+        step artifact is a brief jump. Counted as 'long' in ``stats``.
+        None: no limit (callers pass ``splice_max_gap``, default 1 s).
 
     Returns
     -------
@@ -166,7 +181,8 @@ def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=
         dN = data
         print('Not splicing for alingment was performed')
     elif method == 1:
-        dN = _splice_segments1(data, bad_if, epoch_if, bct=bct, bt=bt, bc=bc)
+        dN = _splice_segments1(data, bad_if, epoch_if, bct=bct, bt=bt, bc=bc,
+                               max_gap=max_gap, stats=stats)
     elif method == 'trend':
         dN = _splice_segments_trend(data, bad_if, epoch_if, bct=bct, bt=bt, bc=bc,
                                     corrected=corrected, window=window, guard=guard,
@@ -178,7 +194,8 @@ def _splice_segments(data, bad_if, epoch_if, bct=None, bt=None, bc=None, method=
                                        step_window=step_window, step_k=step_k,
                                        null_step=null_step, step_min=step_min,
                                        anchor=anchor, anchor_window=anchor_window,
-                                       undecidable=undecidable, stats=stats)
+                                       undecidable=undecidable, stats=stats,
+                                       max_gap=max_gap)
     else:
         raise ValueError(f"splice method must be one of {SPLICE_METHODS} or None, got {method!r}")
     return dN
@@ -408,18 +425,22 @@ def _matched_windows(w_max, w_min):
     return sorted(set(ws), reverse=True)
 
 
-SPLICE_STEP_DECISIONS = ('step', 'no_step', 'undecidable')
+SPLICE_STEP_DECISIONS = ('step', 'no_step', 'undecidable', 'long')
 
 
 def _splice_segments_adaptive(data, bad_if, epoch_if, bct=None, bt=None, bc=None, corrected=None,
                               window=250, guard=5, order=1, align_bad_times=True,
                               step_window=1000, step_min=250, step_k=2.5, null_step=25,
                               anchor='sample', anchor_window=25, undecidable='method1',
-                              stats=None, min_side=3, min_null=20):
+                              stats=None, min_side=3, min_null=20, max_gap=None):
     """Step-aware splicing (see ``_splice_segments``, method ``'adaptive'``).
 
     Per channel, every run of non-good samples (corrected, bad or bad time),
     split at epoch limits, is examined in time order:
+
+    0. Runs longer than ``max_gap`` samples: 'long'. No step decision and no
+       shift of the data after them; their corrected (and bad-time) samples
+       are only aligned at both edges as in 2.
 
     1. Step decision with a matched reference. Window w: the largest of
        ``step_window``, ``step_window``/2, ... down to ``step_min`` that fits
@@ -450,7 +471,7 @@ def _splice_segments_adaptive(data, bad_if, epoch_if, bct=None, bt=None, bc=None
        aligned at both edges as for 'no_step'.
 
     ``stats`` (dict), if given, is incremented with the number of runs per
-    decision ('step', 'no_step', 'undecidable'), counted per channel.
+    decision ('step', 'no_step', 'undecidable', 'long'), counted per channel.
     ``window`` and ``order`` are not used (kept for a common signature).
     """
     if undecidable not in ('method1', 'edges'):
@@ -508,7 +529,12 @@ def _splice_segments_adaptive(data, bad_if, epoch_if, bct=None, bt=None, bc=None
                 avail_r = min(ef, next_start) - ra
                 avail = min(avail_l, avail_r)
                 gap = f0 - i0
-                for w in w_list:
+                if max_gap is not None and gap > max_gap:
+                    decision = 'long'
+                    w_list_run = ()
+                else:
+                    w_list_run = w_list
+                for w in w_list_run:
                     if w > avail:
                         continue
                     key = (gap, w)
@@ -616,8 +642,15 @@ def _prepare_data_for_splicing(data, bad_if, epoch_if, bct, bt, bc):
     return data_, bad_if, epoch_if, bct, bt, bc, I_all, F_all, Epoch_I, Epoch_F
 
 
-def _splice_segments1(data, bad_if, epoch_if, bct=None, bt=None, bc=None):
+def _splice_segments1(data, bad_if, epoch_if, bct=None, bt=None, bc=None, max_gap=None,
+                      stats=None):
     """Splice by aligning each segment to the previous segment endpoint.
+
+    With ``max_gap`` (samples), a corrected segment (from ``bad_if``) longer
+    than that does not shift the data after it: the data after it keep their
+    level and the segment is ramped linearly so that its end meets them (its
+    start is still aligned to the data before it). Counted as 'long' in
+    ``stats`` (per channel).
 
     Parameters
     ----------
@@ -633,6 +666,10 @@ def _splice_segments1(data, bad_if, epoch_if, bct=None, bt=None, bc=None):
         Bad-time mask.
     bc : numpy.ndarray | None, default=None
         Bad-channel mask.
+    max_gap : int | None, default=None
+        Longest corrected segment (samples) after which the data are shifted.
+    stats : dict | None, default=None
+        If given, ``stats['long']`` is incremented per channel and long segment.
 
     Returns
     -------
@@ -640,6 +677,14 @@ def _splice_segments1(data, bad_if, epoch_if, bct=None, bt=None, bc=None):
         Data after segment alignment.
     """
     data, bad_if, epoch_if, bct, bt, bc, I_all, F_all, Epoch_I, Epoch_F = _prepare_data_for_splicing(data, bad_if, epoch_if, bct, bt, bc)
+    if stats is not None:
+        stats.setdefault('long', 0)
+
+    def _is_long_segment(a, b):
+        # [a, b) lies inside one corrected segment longer than max_gap
+        if max_gap is None or b - a <= max_gap:
+            return False
+        return bool(np.any((np.ravel(I_all) <= a) & (np.ravel(F_all) >= b)))
     
     # Splice Segments
     dN = data.copy()
@@ -670,10 +715,22 @@ def _splice_segments1(data, bad_if, epoch_if, bct=None, bt=None, bc=None):
                     
                     # Align the segments of the electrodes with good data in 
                     # previous segment with the previous segment 
+                    # Align the segments of the electrodes with good data in
+                    # previous segment with the previous segment
                     if np.any(np.logical_and(id_good_electrode,  bc==False)):
                         el = np.logical_and(id_good_electrode,  bc==False)
-                        yadd = dN[el, the_I[kk] - 1] - data[el, the_I[kk]]
-                        dN[el, the_I[kk]:the_I[kk+1]] = data[el, the_I[kk]:the_I[kk+1]] + np.tile(yadd, (the_I[kk+1]-the_I[kk], 1)).T
+                        if _is_long_segment(the_I[kk - 1], the_I[kk]):
+                            # long corrected segment: keep the level of the data
+                            # after it and ramp the segment to meet them
+                            a, b = the_I[kk - 1], the_I[kk]
+                            delta = data[el, b] - dN[el, b - 1]
+                            ramp = np.arange(b - a) / max(b - a - 1, 1)
+                            dN[el, a:b] = dN[el, a:b] + np.outer(delta, ramp)
+                            if stats is not None:
+                                stats['long'] += int(np.sum(el))
+                        else:
+                            yadd = dN[el, the_I[kk] - 1] - data[el, the_I[kk]]
+                            dN[el, the_I[kk]:the_I[kk+1]] = data[el, the_I[kk]:the_I[kk+1]] + np.tile(yadd, (the_I[kk+1]-the_I[kk], 1)).T
     
                     # If the previous segment is bad, align the previous  
                     # segment (the one with bad data, kk-1) to the surronfing  
@@ -1411,11 +1468,17 @@ class ArtCorrection:
         self.splice_stats = dict(stats)
         if not stats:
             return
-        total = sum(stats.values())
-        fallback = self.params.get('splice_undecidable', 'method1')
-        print(f"Splicing ({label}, 'adaptive'): {total} runs (per channel): "
-              f"{stats.get('step', 0)} steps, {stats.get('no_step', 0)} without step, "
-              f"{stats.get('undecidable', 0)} undecidable (spliced with '{fallback}')")
+        method = self.params.get('splice_method', 1)
+        if method == 'adaptive':
+            total = sum(stats.values())
+            fallback = self.params.get('splice_undecidable', 'method1')
+            print(f"Splicing ({label}, 'adaptive'): {total} runs (per channel): "
+                  f"{stats.get('step', 0)} steps, {stats.get('no_step', 0)} without step, "
+                  f"{stats.get('undecidable', 0)} undecidable (spliced with '{fallback}'), "
+                  f"{stats.get('long', 0)} long (edges aligned only)")
+        else:
+            print(f"Splicing ({label}, method {method}): {stats.get('long', 0)} long "
+                  f"segments (per channel) not shifting the data after them")
         acc = dict(getattr(raw.artifacts, 'splice_stats', None) or {})
         for k, v in stats.items():
             acc[k] = acc.get(k, 0) + v
@@ -1449,13 +1512,17 @@ class TargetPCA(ArtCorrection):
     splice_step_k : float, default=2.5
         With 'adaptive', a segment is a step if the before/after level
         difference exceeds this many robust SDs (see ``_splice_segments``).
+    splice_max_gap : float | None, default=1.0
+        With method 1 or 'adaptive', corrected / bad segments longer than this
+        (seconds) do not shift the data after them; they are only aligned at
+        their edges. None: no limit (see ``_splice_segments``).
     save_corrected : bool, default=True
         Whether to update correction masks in ``raw.artifacts``.
     """
 
     def __init__(self, max_time=0.100, components_to_remove=None, variance_to_remove=0.98, mask_time=0.05,
                  all_time='all', all_channel='no_bad_channel', all_epochs='all', splice_method=1, save_corrected=True,
-                 splice_undecidable='method1', splice_step_k=2.5):
+                 splice_undecidable='method1', splice_step_k=2.5, splice_max_gap=1.0):
         
         super().__init__()
         
@@ -1465,7 +1532,7 @@ class TargetPCA(ArtCorrection):
                            all_time=all_time, all_channel=all_channel, all_epochs=all_epochs,
                            save_corrected=save_corrected, index_to_remove=[], splice_method=splice_method,
                            splice_undecidable=splice_undecidable, splice_step_k=splice_step_k,
-                           verbose=True)
+                           splice_max_gap=splice_max_gap, verbose=True)
         
 
     def correct(self, raw):         
@@ -1500,6 +1567,7 @@ class TargetPCA(ArtCorrection):
                                                                 splice_method=self.params['splice_method'],
                                                                 splice_undecidable=self.params.get('splice_undecidable', 'method1'),
                                                                 splice_step_k=self.params.get('splice_step_k', 2.5),
+                                                                splice_max_gap=self.params.get('splice_max_gap', 1.0),
                                                                 stats=stats,
                                                                 )
 
@@ -1512,7 +1580,8 @@ class TargetPCA(ArtCorrection):
     @staticmethod
     def apply_target_PCA(raw, max_time=0.100, components_to_remove=None, variance_to_remove=0.98, mask_time=0.05,
                  all_time='all', all_channel='no_bad_channel', all_epochs='all', splice_method=1,
-                 splice_undecidable='method1', splice_step_k=2.5, stats=None):
+                 splice_undecidable='method1', splice_step_k=2.5, stats=None,
+                 splice_max_gap=1.0):
         """Apply target PCA correction and return corrected data plus mask.
 
         Parameters
@@ -1539,6 +1608,8 @@ class TargetPCA(ArtCorrection):
             With 'adaptive': splicing of undecidable segments.
         splice_step_k : float, default=2.5
             With 'adaptive': step threshold in robust SDs.
+        splice_max_gap : float | None, default=1.0
+            Longest segment (s) that may shift the data after it.
         stats : dict | None, default=None
             With 'adaptive': filled with the counts of step decisions.
 
@@ -1684,7 +1755,8 @@ class TargetPCA(ArtCorrection):
                                              step_k=splice_step_k,
                                              null_step=int(round(0.1 * raw.info['sfreq'])),
                                              anchor_window=int(round(0.1 * raw.info['sfreq'])),
-                                             undecidable=splice_undecidable, stats=stats)
+                                             undecidable=splice_undecidable, stats=stats,
+                                             max_gap=_max_gap_samples(splice_max_gap, raw.info['sfreq']))
     
                     # Store the data
                     data_pca[el, :] = d
@@ -1904,6 +1976,10 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
     splice_step_k : float, default=2.5
         With 'adaptive', a segment is a step if the before/after level
         difference exceeds this many robust SDs (see ``_splice_segments``).
+    splice_max_gap : float | None, default=1.0
+        With method 1 or 'adaptive', corrected / bad segments longer than this
+        (seconds) do not shift the data after them; they are only aligned at
+        their edges. None: no limit (see ``_splice_segments``).
     save_corrected : bool, default=True
         Whether to update correction masks in ``raw.artifacts``.
     verbose : bool, default=True
@@ -1914,7 +1990,8 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
 
     def __init__(self, n_jobs=-1, p=0.5, p_neighbors=1, min_good_time=1.00, min_intertime=0.100, mask_time=0.100, 
                  min_segment_time=0.200, splice_method=1, save_corrected=True, verbose=True,
-                 parallelize_mode='auto', splice_undecidable='method1', splice_step_k=2.5):
+                 parallelize_mode='auto', splice_undecidable='method1', splice_step_k=2.5,
+                 splice_max_gap=1.0):
         
         super().__init__(verbose=verbose)
 
@@ -1930,7 +2007,7 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
                            min_intertime=min_intertime, mask_time=mask_time, 
                            min_segment_time=min_segment_time,
                            splice_method=splice_method, splice_undecidable=splice_undecidable,
-                           splice_step_k=splice_step_k,
+                           splice_step_k=splice_step_k, splice_max_gap=splice_max_gap,
                            save_corrected=save_corrected, verbose=verbose,
                            parallelize_mode=parallelize_mode)
     
@@ -2177,7 +2254,8 @@ class SegmentSphericalSplineInterpolation(ArtCorrection):
                                             null_step=int(round(0.1 * sfreq)),
                                             anchor_window=int(round(0.1 * sfreq)),
                                             undecidable=self.params.get('splice_undecidable', 'method1'),
-                                            stats=getattr(self, '_splice_stats_tmp', None))
+                                            stats=getattr(self, '_splice_stats_tmp', None),
+                                            max_gap=_max_gap_samples(self.params.get('splice_max_gap', 1.0), sfreq))
                 interpolatedData[ep,:,:] = dspliced
            
         # reshape if necessary         

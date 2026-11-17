@@ -139,7 +139,7 @@ class SummaryPreprocessing(Summary):
                              "%_bad_times",
                              "n_splice_steps",
                              "n_splice_no_step",
-                             "n_splice_undecidable",
+                             "n_splice_undecidable", "n_splice_long",
                              ],
                          try_loading=try_loading)
         if file_id is None:
@@ -195,6 +195,7 @@ class SummaryPreprocessing(Summary):
             "n_splice_steps": splice.get('step', np.nan),
             "n_splice_no_step": splice.get('no_step', np.nan),
             "n_splice_undecidable": splice.get('undecidable', np.nan),
+            "n_splice_long": splice.get('long', np.nan),
         }
         # summaries loaded from older files may lack the newer columns
         for col in row:
